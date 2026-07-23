@@ -24,3 +24,7 @@ jobs:
 
       - name: Test (pytest)
         run: pytest -v
+        env:
+          GOOGLE_API_KEY: dummy-key-for-ci
+          TAVILY_API_KEY: dummy-key-for-ci
+          GOOGLE_FACT_CHECK_API_KEY: dummy-key-for-ci
