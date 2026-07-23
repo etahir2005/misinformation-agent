@@ -1,0 +1,7 @@
+langgraph>=0.6
+langchain>=1.0
+langchain-google-genai>=2.0
+tavily-python>=0.5
+python-dotenv>=1.0
+pytest>=8.0
+ruff>=0.6
