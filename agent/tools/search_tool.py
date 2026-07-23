@@ -5,21 +5,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 from langchain.tools import tool
-from tavily import TavilyClient, UsageLimitExceededError
+from tavily import UsageLimitExceededError
 
-from agent.config import TAVILY_API_KEY
+from agent.tools._clients import tavily_client
 
 logger = logging.getLogger(__name__)
-
-_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 
 @tool
 def web_search_tool(query: str) -> dict[str, Any]:
-    """Search the web for evidence relevant to a claim.
+    """Search the web for general evidence relevant to a claim.
 
-    Use this tool to gather sources that could support or contradict a claim
-    that needs to be fact-checked.
+    Use this if fact_check_lookup_tool found no existing ruling on the claim.
+    Gathers sources that could support or contradict a claim that needs to be
+    fact-checked.
 
     Args:
         query: A focused search query describing the claim to investigate.
@@ -32,7 +31,7 @@ def web_search_tool(query: str) -> dict[str, Any]:
     logger.info("Searching for: %s", query)
 
     try:
-        response = _client.search(query=query, max_results=5, include_raw_content=False)
+        response = tavily_client.search(query=query, max_results=5, include_raw_content=False)
     except UsageLimitExceededError:
         logger.error("Tavily usage limit exceeded — search skipped for query: %s", query)
         return {

@@ -37,4 +37,5 @@ def _require_env(var_name: str) -> str:
 
 GOOGLE_API_KEY: str = _require_env("GOOGLE_API_KEY")
 TAVILY_API_KEY: str = _require_env("TAVILY_API_KEY")
+GOOGLE_FACT_CHECK_API_KEY: str = _require_env("GOOGLE_FACT_CHECK_API_KEY")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
