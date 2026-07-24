@@ -8,25 +8,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.config import MODEL_NAME
+from agent.config import MODEL_NAME, SYSTEM_PROMPT
 from agent.tools.fact_check_tool import fact_check_lookup_tool
-from agent.tools.search_tool import web_search_tool
 from agent.tools.source_retrieval_tool import source_retrieval_tool
+from agent.tools.web_search_tool import web_search_tool
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = (
-    "You are a fact-checking assistant. Given a claim, first use "
-    "fact_check_lookup_tool to check whether a professional fact-checking "
-    "organization has already ruled on it. If that returns no useful claims, "
-    "use web_search_tool to gather general evidence instead. If the user "
-    "provides a specific article URL, use source_retrieval_tool to read its "
-    "full content before evaluating the claim. Cite the sources you used. "
-    "If the evidence is thin or conflicting, say so explicitly rather than "
-    "guessing. If a tool result contains an \"error\" field, do not retry "
-    "that tool — tell the user plainly that you're temporarily unable to "
-    "check the claim right now."
-)
 
 TOOLS = [fact_check_lookup_tool, web_search_tool, source_retrieval_tool]
 
@@ -38,11 +25,6 @@ def build_orchestrator() -> StateGraph:
         A compiled LangGraph graph ready to invoke.
     """
     model = init_chat_model(f"google_genai:{MODEL_NAME}", temperature=0)
-    # Force a search/lookup on the first turn so the agent always gathers
-    # evidence, even for claims it feels confident about — those are often
-    # exactly the ones worth double-checking. After the first tool call has
-    # happened, fall back to normal tool-choice so it isn't forced into
-    # endless re-searching.
     model_forced_search = model.bind_tools(TOOLS, tool_choice="any")
     model_auto = model.bind_tools(TOOLS)
 

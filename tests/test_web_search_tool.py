@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from agent.tools.search_tool import web_search_tool
+from agent.tools.web_search_tool import web_search_tool
 
 
 @patch("agent.tools.search_tool.tavily_client")
