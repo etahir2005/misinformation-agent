@@ -12,7 +12,7 @@ from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from pydantic import BaseModel, Field
 
-from agent.config import MODEL_NAME
+from agent.config import CREDIBILITY_SCORING_PROMPT, MODEL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +48,6 @@ _credibility_model = init_chat_model(
     f"google_genai:{MODEL_NAME}", temperature=0
 ).with_structured_output(CredibilityAssessment)
 
-_CREDIBILITY_PROMPT = (
-    "You are judging the credibility of evidence gathered about a claim. "
-    "Given the claim and a list of sources (each with a URL and some text "
-    "content), assess how reliable each source is, whether they conflict "
-    "with each other, and how confident a fact-checker should be in a "
-    "verdict based on this evidence. Judge reliability using domain "
-    "reputation, specificity, and consistency with other sources — not "
-    "whether the source happens to agree with what you'd expect."
-)
-
 
 @tool
 def credibility_scoring_tool(claim: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
@@ -83,7 +73,7 @@ def credibility_scoring_tool(claim: str, sources: list[dict[str, Any]]) -> dict[
     try:
         assessment = _credibility_model.invoke(
             [
-                {"role": "system", "content": _CREDIBILITY_PROMPT},
+                {"role": "system", "content": CREDIBILITY_SCORING_PROMPT},
                 {"role": "user", "content": f"Claim: {claim}\n\nSources:\n{sources}"},
             ]
         )

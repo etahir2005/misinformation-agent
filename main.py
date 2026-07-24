@@ -47,5 +47,5 @@ def run_claim(claim: str) -> None:
 
 
 if __name__ == "__main__":
-    test_claim = "Video games cause violent behavior in teenagers."
+    test_claim = "Is it true that the Great Wall of China is visible from space?"
     run_claim(test_claim)
