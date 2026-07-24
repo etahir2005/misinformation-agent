@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from agent.tools.web_search_tool import web_search_tool
 
 
-@patch("agent.tools.search_tool.tavily_client")
+@patch("agent.tools.web_search_tool.tavily_client")
 def test_web_search_tool_returns_structured_sources(mock_client: MagicMock) -> None:
     """web_search_tool should return a structured sources list, not raw text."""
     mock_client.search.return_value = {
