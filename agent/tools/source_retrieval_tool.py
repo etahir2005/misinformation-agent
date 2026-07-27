@@ -38,6 +38,14 @@ def source_retrieval_tool(url: str) -> dict[str, Any]:
             "url": url,
             "error": "search_quota_exhausted",
         }
+    except Exception:
+        # Broad on purpose — see web_search_tool.py for reasoning.
+        logger.exception("Source extraction failed for url: %s", url)
+        return {
+            "content": "",
+            "url": url,
+            "error": "extraction_request_failed",
+        }
 
     results = response.get("results", [])
     if not results:

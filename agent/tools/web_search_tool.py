@@ -39,6 +39,17 @@ def web_search_tool(query: str) -> dict[str, Any]:
             "query_used": query,
             "error": "search_quota_exhausted",
         }
+    except Exception:
+        # Broad on purpose: Tavily can fail in other ways (bad API key,
+        # invalid query, timeouts, a generic TavilyError) with no single
+        # well-known exception type to catch narrowly — this tool is
+        # documented to degrade gracefully on any failure, not just quota.
+        logger.exception("Web search failed for query: %s", query)
+        return {
+            "sources": [],
+            "query_used": query,
+            "error": "search_failed",
+        }
 
     sources = [
         {
