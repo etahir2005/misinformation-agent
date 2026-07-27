@@ -13,7 +13,7 @@ Early build in progress. Currently implemented:
 - `credibility_scoring_tool` — judges source reliability and produces a confidence score when there's no clean existing ruling to rely on
 - Deterministic routing: fact-check database first, web search as fallback, credibility scoring forced whenever the evidence gathered doesn't already amount to a single clean True/False ruling
 - First-turn tool use forced (`tool_choice="any"`) so the agent always gathers evidence before answering
-- A 10-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
+- A 14-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
 - Tests for all four tools, plus the orchestrator's routing logic
 
 Planned next: corrective re-search + authentic-source feature, vector-based claim cache (Pinecone), Postgres-backed persistence, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
@@ -79,13 +79,13 @@ agent/
     _clients.py                    # shared third-party API clients
     credibility_scoring_tool.py    # Gemini-backed source-reliability judgment
     fact_check_tool.py             # Google Fact Check Tools API lookup
-    search_tool.py                 # Tavily-backed web search tool
     source_retrieval_tool.py       # Tavily Extract-backed full-article retrieval
+    web_search_tool.py             # Tavily-backed web search tool
 main.py                            # manual end-to-end test entry point
 tests/
   test_credibility_scoring_tool.py
   test_fact_check_tool.py
   test_orchestrator_routing.py
-  test_search_tool.py
   test_source_retrieval_tool.py
+  test_web_search_tool.py
 ```
