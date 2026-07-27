@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from agent.orchestrator import (
     _build_cache_hit_response,
     _credibility_scoring_call_count,
+    _current_turn_messages,
     _evidence_is_weak,
     _gather_sources_for_scoring,
     _has_evidence_to_score,
@@ -370,6 +371,39 @@ def test_gather_sources_for_scoring_empty_when_no_evidence() -> None:
     assert _gather_sources_for_scoring(state) == []
 
 
+def test_gather_sources_for_scoring_merges_both_search_rounds() -> None:
+    """A retry search shouldn't discard the first round's sources.
+
+    Regression test (caught in PR review): _gather_sources_for_scoring used
+    to only look at the most recent web_search_tool call, so when weak
+    evidence triggered a retry search, the second scoring pass would only
+    see the retry's sources — the original round's evidence was silently
+    dropped instead of being combined with it.
+    """
+    state = {
+        "messages": [
+            HumanMessage(content="claim"),
+            _tool_message(
+                "web_search_tool",
+                {"sources": [{"url": "https://round-one.example", "snippet": "First round."}]},
+            ),
+            _tool_message(
+                "credibility_scoring_tool",
+                {"source_scores": [], "overall_confidence": 0.3, "sources_conflict": False},
+            ),
+            _tool_message(
+                "web_search_tool",
+                {"sources": [{"url": "https://round-two.example", "snippet": "Second round."}]},
+            ),
+        ]
+    }
+
+    sources = _gather_sources_for_scoring(state)
+
+    urls = {s["url"] for s in sources}
+    assert urls == {"https://round-one.example", "https://round-two.example"}
+
+
 def test_has_gathered_evidence_false_before_any_evidence_tool() -> None:
     """_has_gathered_evidence should be False before fact-check/search/retrieval run."""
     state = {"messages": [HumanMessage(content="claim")]}
@@ -489,3 +523,30 @@ def test_store_verdict_if_new_skips_when_vector_lookup_never_called(
     state = {"messages": [HumanMessage(content="claim")]}
     _store_verdict_if_new(state)
     mock_store_verdict.assert_not_called()
+
+
+def test_current_turn_messages_excludes_prior_turns() -> None:
+    """_current_turn_messages should only include messages from the latest HumanMessage on.
+
+    Regression test (caught in PR review): without this scoping, a second
+    claim asked in the same thread would inherit an earlier claim's tool
+    results from history, making the orchestrator think the current claim
+    was already cache-checked or searched when it wasn't.
+    """
+    state = {
+        "messages": [
+            HumanMessage(content="first claim"),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+            _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
+            HumanMessage(content="second claim"),
+        ]
+    }
+    turn_messages = _current_turn_messages(state)
+    assert len(turn_messages) == 1
+    assert turn_messages[0].content == "second claim"
+
+
+def test_current_turn_messages_returns_all_when_no_human_message() -> None:
+    """_current_turn_messages should fall back to the full list if no HumanMessage exists."""
+    state = {"messages": [_tool_message("web_search_tool", {"sources": [], "query_used": "x"})]}
+    assert _current_turn_messages(state) == state["messages"]
