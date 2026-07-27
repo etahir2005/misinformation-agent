@@ -39,7 +39,11 @@ def fact_check_lookup_tool(query: str) -> dict[str, Any]:
             timeout=10,
         )
         response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
+        data = response.json()
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        # ValueError catches response.json() failing on a malformed body —
+        # a 200 response with a non-JSON payload shouldn't crash the tool
+        # any more than a network error should.
         logger.error("Fact Check Tools API request failed for query %r: %s", query, exc)
         return {
             "claims": [],
@@ -47,7 +51,6 @@ def fact_check_lookup_tool(query: str) -> dict[str, Any]:
             "error": "fact_check_lookup_failed",
         }
 
-    data = response.json()
     claims = [
         {
             "claim_text": claim.get("text", ""),

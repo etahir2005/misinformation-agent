@@ -30,3 +30,19 @@ def test_source_retrieval_tool_handles_extraction_failure(mock_client: MagicMock
 
     assert result["content"] == ""
     assert result["error"] == "extraction_failed"
+
+
+@patch("agent.tools.source_retrieval_tool.tavily_client")
+def test_source_retrieval_tool_handles_non_quota_tavily_failure(mock_client: MagicMock) -> None:
+    """A Tavily failure other than quota exhaustion should return an error, not raise.
+
+    Regression test (caught in PR review): only UsageLimitExceededError was
+    being caught, so a bad API key, invalid URL, timeout, or generic
+    TavilyError would crash the tool instead of degrading gracefully.
+    """
+    mock_client.extract.side_effect = RuntimeError("simulated Tavily failure")
+
+    result = source_retrieval_tool.invoke({"url": "https://example.com/article"})
+
+    assert result["content"] == ""
+    assert result["error"] == "extraction_request_failed"
