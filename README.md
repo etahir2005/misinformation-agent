@@ -13,7 +13,7 @@ Early build in progress. Currently implemented:
 - `credibility_scoring_tool` — judges source reliability and produces a confidence score when there's no clean existing ruling to rely on
 - `vector_lookup_tool` — semantic claim cache (Pinecone + local embeddings) that reuses a prior verdict when a claim is a close rewording of one already checked, instead of re-running the full pipeline
 - Deterministic routing: cache check first, then fact-check database, web search as fallback, credibility scoring forced whenever the evidence gathered doesn't already amount to a single clean True/False ruling
-- First-turn tool use forced so the agent always checks the cache and gathers evidence before answering
+- First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
 - Tests for all five tools, plus the orchestrator's routing logic
 
