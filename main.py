@@ -11,7 +11,7 @@ from langgraph.errors import GraphRecursionError  # noqa: E402
 
 from agent.orchestrator import build_orchestrator  # noqa: E402
 
-_MAX_TOOL_LOOP_STEPS = 14
+_MAX_TOOL_LOOP_STEPS = 16
 
 
 def run_claim(claim: str) -> None:
