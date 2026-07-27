@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -20,7 +20,43 @@ logger = logging.getLogger(__name__)
 
 TOOLS = [fact_check_lookup_tool, web_search_tool, source_retrieval_tool, credibility_scoring_tool]
 
-_CLEAN_RATINGS = {"true", "false", "correct", "incorrect", "accurate", "inaccurate"}
+# Real fact-checker rating text is inconsistent across publishers (Snopes,
+# PolitiFact, Reuters, etc. all use their own wording), so this can't be an
+# exhaustive list — it's deliberately narrow. Only ratings that are fully
+# unambiguous go here. Hedged/partial ratings (PolitiFact's "Mostly True" /
+# "Half True" / "Mostly False", Snopes's "Mixture", etc.) are intentionally
+# excluded even though they lean one way — presenting a hedged rating as a
+# clean pass-through verdict would be misleading, so those still go through
+# credibility_scoring_tool for a fair, nuanced summary instead.
+_CLEAN_RATINGS = {
+    "true",
+    "false",
+    "correct",
+    "incorrect",
+    "accurate",
+    "inaccurate",
+    "pants on fire",
+    "pants on fire!",
+}
+
+
+def _current_turn_messages(state: MessagesState) -> list:
+    """Return only the messages from the most recent HumanMessage onward.
+
+    state["messages"] holds the entire thread's history across every turn
+    (InMemorySaver persists it per thread_id), not just the current claim.
+    Every routing decision below needs to reason about only the current
+    turn's tool activity — otherwise a second claim asked in the same
+    thread would look like it's already been searched, just because an
+    earlier claim's tool results are still sitting in history (caught in
+    PR review: `has_searched` was previously unscoped, so a second claim
+    in the same thread would skip the forced first-turn tool call).
+    """
+    messages = state["messages"]
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            return messages[index:]
+    return messages
 
 
 def _last_tool_result(state: MessagesState, tool_name: str) -> dict | None:
@@ -32,6 +68,24 @@ def _last_tool_result(state: MessagesState, tool_name: str) -> dict | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _all_tool_results(state: MessagesState, tool_name: str) -> list[dict]:
+    """Return every parsed ToolMessage result for a given tool, in call order.
+
+    Unlike _last_tool_result, this doesn't discard earlier calls. Needed
+    for web_search_tool specifically: the retry-search loop can call it
+    twice in one turn, and the system prompt frames the retry as gathering
+    an *additional* round of evidence, not replacing the first round.
+    """
+    results = []
+    for message in state["messages"]:
+        if isinstance(message, ToolMessage) and message.name == tool_name:
+            try:
+                results.append(json.loads(message.content))
+            except (TypeError, ValueError):
+                continue
+    return results
 
 
 def _last_tool_message_index(state: MessagesState, tool_name: str) -> int | None:
@@ -157,8 +211,10 @@ def _gather_sources_for_scoring(state: MessagesState) -> list[dict[str, Any]]:
                 }
             )
 
-    search_result = _last_tool_result(state, "web_search_tool")
-    if search_result:
+    # All rounds, not just the most recent — a retry search adds evidence
+    # on top of the first round rather than replacing it (see
+    # _all_tool_results).
+    for search_result in _all_tool_results(state, "web_search_tool"):
         for result in search_result.get("sources", []):
             sources.append({"url": result.get("url", ""), "content": result.get("snippet", "")})
 
@@ -179,14 +235,21 @@ def build_orchestrator() -> StateGraph:
 
     def call_model(state: MessagesState) -> dict:
         """Invoke the LLM with the current conversation state."""
+        # Every routing decision below must look only at the current turn's
+        # tool activity, not the whole thread — see _current_turn_messages.
+        turn_state = {"messages": _current_turn_messages(state)}
+
+        # Gemini itself still sees the full thread history, not just the
+        # current turn — that's what gives it multi-turn conversational
+        # context. Only the deterministic routing below is turn-scoped.
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        has_searched = any(isinstance(m, ToolMessage) for m in state["messages"])
+        has_searched = any(isinstance(m, ToolMessage) for m in turn_state["messages"])
 
         if not has_searched:
             model_to_use = model_forced_search
-        elif _should_force_retry_search(state):
+        elif _should_force_retry_search(turn_state):
             model_to_use = model_forced_retry_search
-        elif _should_force_credibility_scoring(state):
+        elif _should_force_credibility_scoring(turn_state):
             model_to_use = model_forced_credibility
         else:
             model_to_use = model_auto
@@ -195,7 +258,7 @@ def build_orchestrator() -> StateGraph:
 
         for tool_call in response.tool_calls:
             if tool_call["name"] == "credibility_scoring_tool":
-                tool_call["args"]["sources"] = _gather_sources_for_scoring(state)
+                tool_call["args"]["sources"] = _gather_sources_for_scoring(turn_state)
 
         return {"messages": [response]}
 
