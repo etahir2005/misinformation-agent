@@ -6,7 +6,7 @@ from typing import Any
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -53,10 +53,10 @@ def _current_turn_messages(state: MessagesState) -> list:
     """Return only the messages from the most recent HumanMessage onward.
 
     state["messages"] holds the entire thread's history across every turn
-    (InMemorySaver persists it per thread_id), not just the current claim.
-    Every routing decision below needs to reason about only the current
-    turn's tool activity — otherwise a second claim asked in the same
-    thread would look like it's already been cache-checked or searched
+    (persisted per thread_id by the checkpointer), not just the current
+    claim. Every routing decision below needs to reason about only the
+    current turn's tool activity — otherwise a second claim asked in the
+    same thread would look like it's already been cache-checked or searched
     just because an earlier claim's tool results are still sitting in
     history (caught in PR review: this was previously unscoped, and a
     cache hit from an earlier claim would incorrectly short-circuit every
@@ -307,8 +307,14 @@ def _store_verdict_if_new(state: MessagesState) -> None:
         )
 
 
-def build_orchestrator() -> StateGraph:
+def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
     """Build and compile the single-agent orchestrator graph.
+
+    Args:
+        checkpointer: A LangGraph checkpointer (e.g. the Postgres-backed one
+            from agent.checkpointer.build_checkpointer, or InMemorySaver in
+            tests) — injected rather than constructed here so this module
+            stays decoupled from where/how state is actually persisted.
 
     Returns:
         A compiled LangGraph graph ready to invoke.
@@ -365,6 +371,6 @@ def build_orchestrator() -> StateGraph:
     builder.add_conditional_edges("orchestrator", tools_condition)
     builder.add_edge("tools", "orchestrator")
 
-    graph = builder.compile(checkpointer=InMemorySaver())
+    graph = builder.compile(checkpointer=checkpointer)
     logger.info("Orchestrator graph compiled with %d tool(s).", len(TOOLS))
     return graph
