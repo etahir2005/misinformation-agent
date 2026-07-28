@@ -1,20 +1,25 @@
 """Unit tests for the orchestrator's deterministic routing logic."""
 
 import json
+from unittest.mock import MagicMock, patch
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agent.orchestrator import (
+    _build_cache_hit_response,
     _credibility_scoring_call_count,
     _current_turn_messages,
     _evidence_is_weak,
     _gather_sources_for_scoring,
     _has_evidence_to_score,
+    _has_gathered_evidence,
+    _last_tool_call_args,
     _last_tool_message_index,
     _last_tool_result,
     _needs_credibility_scoring,
     _should_force_credibility_scoring,
     _should_force_retry_search,
+    _store_verdict_if_new,
 )
 
 
@@ -399,18 +404,140 @@ def test_gather_sources_for_scoring_merges_both_search_rounds() -> None:
     assert urls == {"https://round-one.example", "https://round-two.example"}
 
 
+def test_has_gathered_evidence_false_before_any_evidence_tool() -> None:
+    """_has_gathered_evidence should be False before fact-check/search/retrieval run."""
+    state = {"messages": [HumanMessage(content="claim")]}
+    assert _has_gathered_evidence(state) is False
+
+
+def test_has_gathered_evidence_true_after_fact_check() -> None:
+    """_has_gathered_evidence should be True once fact_check_lookup_tool has run."""
+    state = {
+        "messages": [
+            HumanMessage(content="claim"),
+            _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
+        ]
+    }
+    assert _has_gathered_evidence(state) is True
+
+
+def test_build_cache_hit_response_includes_summary_and_sources() -> None:
+    """_build_cache_hit_response should surface the cached verdict summary and sources."""
+    cache_result = {
+        "hit": True,
+        "confidence": 0.9,
+        "sources": ["https://example.com/a", "https://example.com/b"],
+        "verdict_summary": "This claim is false.",
+    }
+
+    response = _build_cache_hit_response(cache_result)
+
+    assert "This claim is false." in response.content
+    assert "https://example.com/a" in response.content
+    assert "https://example.com/b" in response.content
+
+
+def test_last_tool_call_args_returns_args_for_matching_tool_call() -> None:
+    """_last_tool_call_args should return the args dict from the matching tool call."""
+    state = {
+        "messages": [
+            HumanMessage(content="Is it true that the sky is green?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "vector_lookup_tool",
+                        "args": {"claim": "The sky is green"},
+                        "id": "call_1",
+                    }
+                ],
+            ),
+        ]
+    }
+    assert _last_tool_call_args(state, "vector_lookup_tool") == {"claim": "The sky is green"}
+
+
+def test_last_tool_call_args_none_when_tool_not_called() -> None:
+    """_last_tool_call_args should return None if the tool was never called."""
+    state = {"messages": [HumanMessage(content="claim")]}
+    assert _last_tool_call_args(state, "vector_lookup_tool") is None
+
+
+@patch("agent.orchestrator.store_verdict")
+def test_store_verdict_if_new_uses_vector_lookup_claim_text(
+    mock_store_verdict: MagicMock,
+) -> None:
+    """Storage should embed the same claim text vector_lookup_tool used, not the raw message."""
+    state = {
+        "messages": [
+            HumanMessage(content="Is it true that the sky is green?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "vector_lookup_tool",
+                        "args": {"claim": "The sky is green"},
+                        "id": "call_1",
+                    }
+                ],
+            ),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fact_check_lookup_tool",
+                        "args": {"query": "sky green"},
+                        "id": "call_2",
+                    }
+                ],
+            ),
+            _tool_message(
+                "fact_check_lookup_tool",
+                {
+                    "claims": [
+                        {
+                            "rating": "False",
+                            "url": "https://a.com",
+                            "publisher": "X",
+                            "claim_text": "The sky is green",
+                        }
+                    ],
+                    "query_used": "sky green",
+                },
+            ),
+        ]
+    }
+
+    _store_verdict_if_new(state)
+
+    mock_store_verdict.assert_called_once()
+    assert mock_store_verdict.call_args.kwargs["claim"] == "The sky is green"
+
+
+@patch("agent.orchestrator.store_verdict")
+def test_store_verdict_if_new_skips_when_vector_lookup_never_called(
+    mock_store_verdict: MagicMock,
+) -> None:
+    """No claim text to store should mean no store call at all."""
+    state = {"messages": [HumanMessage(content="claim")]}
+    _store_verdict_if_new(state)
+    mock_store_verdict.assert_not_called()
+
+
 def test_current_turn_messages_excludes_prior_turns() -> None:
     """_current_turn_messages should only include messages from the latest HumanMessage on.
 
     Regression test (caught in PR review): without this scoping, a second
     claim asked in the same thread would inherit an earlier claim's tool
     results from history, making the orchestrator think the current claim
-    was already searched when it wasn't.
+    was already cache-checked or searched when it wasn't.
     """
     state = {
         "messages": [
             HumanMessage(content="first claim"),
-            _tool_message("web_search_tool", {"sources": [], "query_used": "x"}),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+            _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
             HumanMessage(content="second claim"),
         ]
     }

@@ -42,13 +42,27 @@ MODEL_NAME: str = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
+PINECONE_API_KEY: str = _require_env("PINECONE_API_KEY")
+PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "misinformation-agent-claims")
+CLAIM_SIMILARITY_THRESHOLD = 0.82
+
+# Neon Postgres connection string, e.g.
+# postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
+# Use Neon's *direct* connection string, not the pooled/PgBouncer one (the
+# one with "-pooler" in the hostname) — the checkpointer needs
+# session-level Postgres features a transaction pooler can break.
+POSTGRES_CONNECTION_STRING: str = _require_env("POSTGRES_CONNECTION_STRING")
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
-    "fact_check_lookup_tool to check whether a professional fact-checking "
-    "organization has already ruled on it. If that returns no useful claims, "
-    "use web_search_tool to gather general evidence instead. If the user "
-    "provides a specific article URL, use source_retrieval_tool to read its "
-    "full content before evaluating the claim. "
+    "vector_lookup_tool to check whether a semantically similar claim has "
+    "already been resolved — if there's a match, its verdict is reused "
+    "automatically. If not, use fact_check_lookup_tool to check whether a "
+    "professional fact-checking organization has already ruled on it. If "
+    "that returns no useful claims, use web_search_tool to gather general "
+    "evidence instead. If the user provides a specific article URL, use "
+    "source_retrieval_tool to read its full content before evaluating the "
+    "claim. "
     "If there is no single, clean True/False ruling from fact_check_lookup_tool, "
     "you will be required to call credibility_scoring_tool to form your own "
     "judgment from the evidence gathered so far — pass it the claim and the "
