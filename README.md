@@ -15,15 +15,16 @@ Early build in progress. Currently implemented:
 - Deterministic routing: cache check first, then fact-check database, web search as fallback, credibility scoring forced whenever the evidence gathered doesn't already amount to a single clean True/False ruling
 - First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
-- Tests for all five tools, plus the orchestrator's routing logic
+- Postgres-backed persistence (Neon) via `agent/checkpointer.py` — conversation state survives restarts, keyed by thread_id. The checkpointer is injected into `build_orchestrator()` rather than hardcoded, so tests still use `InMemorySaver`
+- Tests for all five tools, the orchestrator's routing logic, and the checkpointer
 
-Planned next: corrective re-search + authentic-source feature, Postgres-backed persistence, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
+Planned next: corrective re-search + authentic-source feature, context-length handling for long-running threads, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
 
 ## Architecture
 
 - **Orchestrator** — a single LangGraph agent, not a multi-agent supervisor setup. One model, multiple tools underneath.
 - **Tools** — each tool returns a structured dict, not raw text, so the orchestrator can reason over results reliably.
-- **Persistence** — currently in-memory (`InMemorySaver`); migrating to Postgres (Neon) once the core loop is stable.
+- **Persistence** — Postgres (Neon), via `agent/checkpointer.py`. `build_orchestrator()` takes the checkpointer as an injected argument rather than constructing one itself, so tests can pass `InMemorySaver` without touching a real database.
 
 ## Setup
 
@@ -45,7 +46,12 @@ Planned next: corrective re-search + authentic-source feature, Postgres-backed p
    - Sign up at pinecone.io and create a serverless index named to match `PINECONE_INDEX_NAME` (default `misinformation-agent-claims`)
    - Set dimensions to `768` and metric to `cosine` — this must match the output of the `BAAI/bge-base-en-v1.5` embedding model used by `vector_lookup_tool.py`, which normalizes its embeddings for cosine comparison
 
-4. Copy `.env.example` to `.env` and fill in your API keys:
+4. Set up a Neon Postgres database:
+
+   - Sign up at neon.com and create a project (free tier is enough for development)
+   - From the project dashboard, click **Connect** and copy the **direct** connection string (the hostname should *not* contain `-pooler` — the checkpointer needs session-level Postgres features a transaction pooler can break)
+
+5. Copy `.env.example` to `.env` and fill in your API keys:
 
 ```
    GOOGLE_API_KEY=
@@ -54,9 +60,10 @@ Planned next: corrective re-search + authentic-source feature, Postgres-backed p
    PINECONE_API_KEY=
    PINECONE_INDEX_NAME=
    MODEL_NAME=gemini-3.1-flash-lite
+   POSTGRES_CONNECTION_STRING=
 ```
 
-5. Run a test claim through the agent:
+6. Run a test claim through the agent:
 
 ```
    venv\Scripts\python.exe main.py
@@ -77,6 +84,7 @@ venv\Scripts\python.exe -m ruff check .
 - Google Fact Check Tools API — existing fact-check lookups
 - Pinecone — vector database for the semantic claim cache
 - sentence-transformers (BAAI/bge-base-en-v1.5) — local embedding model for the claim cache
+- Postgres (Neon) via `langgraph-checkpoint-postgres` / `psycopg` — conversation state persistence
 - pytest, ruff — testing and linting
 
 ## Project structure
@@ -84,6 +92,7 @@ venv\Scripts\python.exe -m ruff check .
 ```
 agent/
   config.py                       # env var loading, logging setup
+  checkpointer.py                 # Postgres (Neon) checkpointer factory
   orchestrator.py                 # LangGraph StateGraph, tool-calling loop, routing logic
   tools/
     _clients.py                    # shared third-party API clients
@@ -94,6 +103,7 @@ agent/
     web_search_tool.py             # Tavily-backed web search tool
 main.py                            # manual end-to-end test entry point
 tests/
+  test_checkpointer.py
   test_credibility_scoring_tool.py
   test_fact_check_tool.py
   test_orchestrator_routing.py

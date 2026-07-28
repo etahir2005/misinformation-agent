@@ -46,6 +46,13 @@ PINECONE_API_KEY: str = _require_env("PINECONE_API_KEY")
 PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "misinformation-agent-claims")
 CLAIM_SIMILARITY_THRESHOLD = 0.82
 
+# Neon Postgres connection string, e.g.
+# postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
+# Use Neon's *direct* connection string, not the pooled/PgBouncer one (the
+# one with "-pooler" in the hostname) — the checkpointer needs
+# session-level Postgres features a transaction pooler can break.
+POSTGRES_CONNECTION_STRING: str = _require_env("POSTGRES_CONNECTION_STRING")
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
     "vector_lookup_tool to check whether a semantically similar claim has "
