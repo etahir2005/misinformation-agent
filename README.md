@@ -40,16 +40,23 @@ Planned next: corrective re-search + authentic-source feature, Postgres-backed p
    venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-3. Copy `.env.example` to `.env` and fill in your API keys:
+3. Set up a Pinecone index for the semantic claim cache:
+
+   - Sign up at pinecone.io and create a serverless index named to match `PINECONE_INDEX_NAME` (default `misinformation-agent-claims`)
+   - Set dimensions to `768` and metric to `cosine` — this must match the output of the `BAAI/bge-base-en-v1.5` embedding model used by `vector_lookup_tool.py`, which normalizes its embeddings for cosine comparison
+
+4. Copy `.env.example` to `.env` and fill in your API keys:
 
 ```
    GOOGLE_API_KEY=
    TAVILY_API_KEY=
    GOOGLE_FACT_CHECK_API_KEY=
+   PINECONE_API_KEY=
+   PINECONE_INDEX_NAME=
    MODEL_NAME=gemini-3.1-flash-lite
 ```
 
-4. Run a test claim through the agent:
+5. Run a test claim through the agent:
 
 ```
    venv\Scripts\python.exe main.py

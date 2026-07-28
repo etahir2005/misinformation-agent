@@ -26,14 +26,37 @@ from agent.config import (
 
 logger = logging.getLogger(__name__)
 
-_embedding_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-_pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
-_index = _pinecone_client.Index(PINECONE_INDEX_NAME)
+# Constructed lazily (see _get_embedding_model / _get_index below), not at
+# import time. Building these eagerly at module import made just importing
+# this module — which orchestrator.py, main.py, and test_orchestrator_routing.py
+# all do transitively — require live Pinecone credentials, a pre-provisioned
+# index, and network access, even for tests that only exercise pure routing
+# logic and never touch Pinecone at all.
+_embedding_model: SentenceTransformer | None = None
+_pinecone_client: Pinecone | None = None
+_index = None
+
+
+def _get_embedding_model() -> SentenceTransformer:
+    """Construct the embedding model on first use, then reuse it."""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    return _embedding_model
+
+
+def _get_index():
+    """Construct the Pinecone client/index on first use, then reuse it."""
+    global _pinecone_client, _index
+    if _index is None:
+        _pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+        _index = _pinecone_client.Index(PINECONE_INDEX_NAME)
+    return _index
 
 
 def _embed(text: str) -> list[float]:
     """Embed a single piece of text into a vector for Pinecone."""
-    return _embedding_model.encode(text, normalize_embeddings=True).tolist()
+    return _get_embedding_model().encode(text, normalize_embeddings=True).tolist()
 
 
 @tool
@@ -55,7 +78,7 @@ def vector_lookup_tool(claim: str) -> dict[str, Any]:
 
     try:
         query_vector = _embed(claim)
-        result = _index.query(vector=query_vector, top_k=1, include_metadata=True)
+        result = _get_index().query(vector=query_vector, top_k=1, include_metadata=True)
     except Exception:
         logger.exception("Claim cache lookup failed for: %s", claim)
         return {"hit": False, "error": "vector_lookup_failed"}
@@ -102,7 +125,7 @@ def store_verdict(
     """
     try:
         vector = _embed(claim)
-        _index.upsert(
+        _get_index().upsert(
             vectors=[
                 {
                     "id": str(uuid.uuid4()),
