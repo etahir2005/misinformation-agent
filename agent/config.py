@@ -46,6 +46,15 @@ PINECONE_API_KEY: str = _require_env("PINECONE_API_KEY")
 PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "misinformation-agent-claims")
 CLAIM_SIMILARITY_THRESHOLD = 0.82
 
+# Once the messages preceding the current turn reach this count, they get
+# compressed into a running summary (see agent/summarizer.py) instead of
+# being resent to Gemini in full on every turn forever. Deliberately a
+# message count, not a token count — simple, deterministic, and easy to
+# test, matching the other thresholds in this file. A typical resolved claim
+# is roughly 4-8 messages, so this triggers after a handful of claims in the
+# same thread, not on every turn.
+MAX_MESSAGES_BEFORE_SUMMARY = 20
+
 # Neon Postgres connection string, e.g.
 # postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
 # Use Neon's *direct* connection string, not the pooled/PgBouncer one (the
@@ -86,4 +95,18 @@ CREDIBILITY_SCORING_PROMPT: str = (
     "verdict based on this evidence. Judge reliability using domain "
     "reputation, specificity, and consistency with other sources — not "
     "whether the source happens to agree with what you'd expect."
+)
+
+SUMMARIZATION_PROMPT: str = (
+    "You maintain a running summary of an ongoing fact-checking conversation "
+    "so it can continue across many claims without resending the entire "
+    "history. Given the existing summary (if any) and a new chunk of "
+    "conversation to fold in, produce one updated, concise summary. "
+    "Preserve every distinct claim discussed and its verdict — do not "
+    "generalize specific claims away or drop any of them. Do not include "
+    "tool mechanics (which tool was called, raw source URLs, confidence "
+    "scores) — only the substance of what was asked and what was concluded, "
+    "in plain language.\n\n"
+    "Existing summary:\n{existing_summary}\n\n"
+    "New conversation to fold in:\n{conversation_text}"
 )

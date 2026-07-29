@@ -16,30 +16,30 @@ Early build in progress. Currently implemented:
 - First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
 - Postgres-backed persistence (Neon) via `agent/checkpointer.py` — conversation state survives restarts, keyed by thread_id. The checkpointer is injected into `build_orchestrator()` rather than hardcoded, so tests still use `InMemorySaver`
-- Tests for all five tools, the orchestrator's routing logic, and the checkpointer
+- `agent/summarizer.py` — compresses older, fully-resolved turns into a running summary once a thread's history crosses `MAX_MESSAGES_BEFORE_SUMMARY`, so long-running threads don't exceed Gemini's context window. Never touches the turn currently in progress. Model is lazy-initialized, same pattern as `vector_lookup_tool.py`
+- Tests for all five tools, the orchestrator's routing logic, the checkpointer, and the summarizer
 
-Planned next: corrective re-search + authentic-source feature, context-length handling for long-running threads, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
+Planned next: corrective re-search + authentic-source feature, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
 
 ## Architecture
 
 - **Orchestrator** — a single LangGraph agent, not a multi-agent supervisor setup. One model, multiple tools underneath.
 - **Tools** — each tool returns a structured dict, not raw text, so the orchestrator can reason over results reliably.
 - **Persistence** — Postgres (Neon), via `agent/checkpointer.py`. `build_orchestrator()` takes the checkpointer as an injected argument rather than constructing one itself, so tests can pass `InMemorySaver` without touching a real database.
+- **Context management** — `agent/summarizer.py`, wired in as a `"summarize"` graph node reached via a conditional edge off `START`. Self-limiting: once it runs, older-message count drops back below threshold until enough new messages accumulate again.
 
 ## Setup
 
 1. Create a virtual environment:
 
-```
-   python -m venv venv
-   venv\Scripts\activate
-```
+python -m venv venv
+venv\Scripts\activate
+
 
 2. Install dependencies:
 
-```
-   venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+venv\Scripts\python.exe -m pip install -r requirements.txt
+
 
 3. Set up a Pinecone index for the semantic claim cache:
 
@@ -53,28 +53,25 @@ Planned next: corrective re-search + authentic-source feature, context-length ha
 
 5. Copy `.env.example` to `.env` and fill in your API keys:
 
-```
-   GOOGLE_API_KEY=
-   TAVILY_API_KEY=
-   GOOGLE_FACT_CHECK_API_KEY=
-   PINECONE_API_KEY=
-   PINECONE_INDEX_NAME=
-   MODEL_NAME=gemini-3.1-flash-lite
-   POSTGRES_CONNECTION_STRING=
-```
+GOOGLE_API_KEY=
+TAVILY_API_KEY=
+GOOGLE_FACT_CHECK_API_KEY=
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=
+MODEL_NAME=gemini-3.1-flash-lite
+POSTGRES_CONNECTION_STRING=
+
 
 6. Run a test claim through the agent:
 
-```
-   venv\Scripts\python.exe main.py
-```
+venv\Scripts\python.exe main.py
+
 
 ## Testing
 
-```
 venv\Scripts\python.exe -m pytest
 venv\Scripts\python.exe -m ruff check .
-```
+
 
 ## Tech stack
 
@@ -89,25 +86,26 @@ venv\Scripts\python.exe -m ruff check .
 
 ## Project structure
 
-```
 agent/
-  config.py                       # env var loading, logging setup
-  checkpointer.py                 # Postgres (Neon) checkpointer factory
-  orchestrator.py                 # LangGraph StateGraph, tool-calling loop, routing logic
-  tools/
-    _clients.py                    # shared third-party API clients
-    credibility_scoring_tool.py    # Gemini-backed source-reliability judgment
-    fact_check_tool.py             # Google Fact Check Tools API lookup
-    source_retrieval_tool.py       # Tavily Extract-backed full-article retrieval
-    vector_lookup_tool.py          # Pinecone-backed semantic claim cache
-    web_search_tool.py             # Tavily-backed web search tool
-main.py                            # manual end-to-end test entry point
+config.py # env var loading, logging setup
+checkpointer.py # Postgres (Neon) checkpointer factory
+orchestrator.py # LangGraph StateGraph, tool-calling loop, routing logic
+summarizer.py # conversation summarization for long-running threads
+tools/
+_clients.py # shared third-party API clients
+credibility_scoring_tool.py # Gemini-backed source-reliability judgment
+fact_check_tool.py # Google Fact Check Tools API lookup
+source_retrieval_tool.py # Tavily Extract-backed full-article retrieval
+vector_lookup_tool.py # Pinecone-backed semantic claim cache
+web_search_tool.py # Tavily-backed web search tool
+main.py # manual end-to-end test entry point
 tests/
-  test_checkpointer.py
-  test_credibility_scoring_tool.py
-  test_fact_check_tool.py
-  test_orchestrator_routing.py
-  test_source_retrieval_tool.py
-  test_vector_lookup_tool.py
-  test_web_search_tool.py
-```
+test_checkpointer.py
+test_credibility_scoring_tool.py
+test_fact_check_tool.py
+test_orchestrator_build.py
+test_orchestrator_routing.py
+test_source_retrieval_tool.py
+test_summarizer.py
+test_vector_lookup_tool.py
+test_web_search_tool.py

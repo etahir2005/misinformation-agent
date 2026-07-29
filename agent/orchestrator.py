@@ -2,15 +2,27 @@
 
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.config import LOW_CONFIDENCE_THRESHOLD, MODEL_NAME, SYSTEM_PROMPT
+from agent.config import (
+    LOW_CONFIDENCE_THRESHOLD,
+    MAX_MESSAGES_BEFORE_SUMMARY,
+    MODEL_NAME,
+    SYSTEM_PROMPT,
+)
+from agent.summarizer import summarize
 from agent.tools.credibility_scoring_tool import credibility_scoring_tool
 from agent.tools.fact_check_tool import fact_check_lookup_tool
 from agent.tools.source_retrieval_tool import source_retrieval_tool
@@ -48,6 +60,11 @@ _CLEAN_RATINGS = {
     "pants on fire!",
 }
 
+# Fixed id so the stored summary message can be found, replaced, and
+# excluded from what actually gets sent to Gemini (see
+# _existing_summary_text and call_model below) — never rely on position.
+_SUMMARY_MESSAGE_ID = "conversation-summary"
+
 
 def _current_turn_messages(state: MessagesState) -> list:
     """Return only the messages from the most recent HumanMessage onward.
@@ -67,6 +84,48 @@ def _current_turn_messages(state: MessagesState) -> list:
         if isinstance(messages[index], HumanMessage):
             return messages[index:]
     return messages
+
+
+def _messages_before_current_turn(state: MessagesState) -> list:
+    """Return every message before the most recent HumanMessage.
+
+    The complement of _current_turn_messages — used only for summarization,
+    which must never touch the turn currently in progress (the model still
+    needs that context intact to finish resolving the current claim).
+    """
+    messages = state["messages"]
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            return messages[:index]
+    return []
+
+
+def _existing_summary_text(messages: list) -> str | None:
+    """Return the stored running summary's text, if one exists in this message list."""
+    for message in messages:
+        if getattr(message, "id", None) == _SUMMARY_MESSAGE_ID:
+            return message.content
+    return None
+
+
+def _format_messages_for_summary(messages: list) -> str:
+    """Render messages as plain text for the summarization prompt.
+
+    Deliberately simple (role + text content only) — the summarization
+    model needs what was asked and concluded, not tool-call machinery.
+    Skips the stored summary placeholder itself (passed separately as
+    existing_summary) and any message with empty content.
+    """
+    lines = []
+    for message in messages:
+        if getattr(message, "id", None) == _SUMMARY_MESSAGE_ID:
+            continue
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        if not content.strip():
+            continue
+        role = message.__class__.__name__.replace("Message", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
 
 
 def _last_tool_result(state: MessagesState, tool_name: str) -> dict | None:
@@ -307,6 +366,43 @@ def _store_verdict_if_new(state: MessagesState) -> None:
         )
 
 
+def _needs_summary(state: MessagesState) -> Literal["summarize", "orchestrator"]:
+    """Route to the summarize node only once older history crosses the threshold.
+
+    Checked once at the very start of each turn (see build_orchestrator's
+    START edge). Self-limiting: once summarize_node runs, the older-message
+    count drops back down to just the one summary placeholder, so this
+    won't fire again until enough new messages accumulate.
+    """
+    older_messages = _messages_before_current_turn(state)
+    if len(older_messages) >= MAX_MESSAGES_BEFORE_SUMMARY:
+        return "summarize"
+    return "orchestrator"
+
+
+def summarize_node(state: MessagesState) -> dict:
+    """Compress older, fully-resolved turns into a single running summary message.
+
+    Only reached when _needs_summary routes here. Removes every message
+    before the current turn (including any prior summary placeholder) and
+    replaces them with one updated SystemMessage holding the new summary —
+    never touches the turn currently in progress.
+    """
+    older_messages = _messages_before_current_turn(state)
+    existing_summary = _existing_summary_text(older_messages)
+    conversation_text = _format_messages_for_summary(older_messages)
+
+    new_summary_text = summarize(existing_summary, conversation_text)
+    if new_summary_text is None:
+        # Summarization failed — leave history untouched this turn rather
+        # than delete messages with nothing to replace them with.
+        return {"messages": []}
+
+    removals = [RemoveMessage(id=message.id) for message in older_messages]
+    summary_message = SystemMessage(content=new_summary_text, id=_SUMMARY_MESSAGE_ID)
+    return {"messages": removals + [summary_message]}
+
+
 def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
     """Build and compile the single-agent orchestrator graph.
 
@@ -339,7 +435,23 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
         # Gemini itself still sees the full thread history, not just the
         # current turn — that's what gives it multi-turn conversational
         # context. Only the deterministic routing above is turn-scoped.
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        # If older history has been summarized, fold that summary into the
+        # system prompt (one combined SystemMessage, not two separate
+        # ones — safer across chat-model integrations) and exclude the raw
+        # stored placeholder from what's actually sent.
+        summary_text = _existing_summary_text(state["messages"])
+        system_prompt = SYSTEM_PROMPT
+        if summary_text:
+            system_prompt = (
+                f"{SYSTEM_PROMPT}\n\nSummary of earlier claims already "
+                f"discussed in this thread:\n{summary_text}"
+            )
+        sendable_messages = [
+            message
+            for message in state["messages"]
+            if getattr(message, "id", None) != _SUMMARY_MESSAGE_ID
+        ]
+        messages = [SystemMessage(content=system_prompt)] + sendable_messages
 
         if cache_result is None:
             model_to_use = model_forced_cache_check
@@ -364,10 +476,14 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
         return {"messages": [response]}
 
     builder = StateGraph(MessagesState)
+    builder.add_node("summarize", summarize_node)
     builder.add_node("orchestrator", call_model)
     builder.add_node("tools", ToolNode(TOOLS))
 
-    builder.add_edge(START, "orchestrator")
+    builder.add_conditional_edges(
+        START, _needs_summary, {"summarize": "summarize", "orchestrator": "orchestrator"}
+    )
+    builder.add_edge("summarize", "orchestrator")
     builder.add_conditional_edges("orchestrator", tools_condition)
     builder.add_edge("tools", "orchestrator")
 
