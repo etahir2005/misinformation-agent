@@ -11,3 +11,7 @@ pinecone
 sentence-transformers
 langgraph-checkpoint-postgres>=2.0
 psycopg[binary,pool]>=3.1
+fastapi
+uvicorn[standard]
+streamlit
+requests
