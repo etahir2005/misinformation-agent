@@ -6,16 +6,21 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphRecursionError
 
+from agent.guardrail import MessageIntent
 from graph import build_graph, run_claim
 
 
+@patch("agent.guardrail._get_intent_model")
 @patch("agent.orchestrator.init_chat_model")
-def test_run_claim_returns_final_answer(mock_init_chat_model: MagicMock) -> None:
+def test_run_claim_returns_final_answer(
+    mock_init_chat_model: MagicMock, mock_get_intent_model: MagicMock
+) -> None:
     """A normal claim should resolve to a final answer with no recursion issues."""
     mock_model = MagicMock()
     mock_model.bind_tools.return_value = mock_model
     mock_model.invoke.return_value = AIMessage(content="Final answer.")
     mock_init_chat_model.return_value = mock_model
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
 
     graph = build_graph(InMemorySaver())
     result = run_claim(graph, "Is the sky blue?", "test-thread")

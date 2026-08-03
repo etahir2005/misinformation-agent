@@ -16,20 +16,23 @@ Early build in progress. Currently implemented:
 - First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
 - Postgres-backed persistence (Neon) via `agent/checkpointer.py` — conversation state survives restarts, keyed by thread_id. The checkpointer is injected into `build_orchestrator()` rather than hardcoded, so tests still use `InMemorySaver`
-- `agent/summarizer.py` — compresses older, fully-resolved turns into a running summary once a thread's history crosses `MAX_MESSAGES_BEFORE_SUMMARY`, so long-running threads don't exceed Gemini's context window. Never touches the turn currently in progress. Model is lazy-initialized, same pattern as `vector_lookup_tool.py`
 - `graph.py` — shared graph-building and invocation logic, used by both the FastAPI app and the CLI script
 - `main.py` — FastAPI app wrapping the graph, with a `/chat` endpoint and a `/health` check. Checkpointer is opened once at startup via `lifespan`, not per request. `/chat` requires an `X-API-Key` header matching `API_ACCESS_KEY` (the app refuses to start without it set) — `/health` stays open for uptime monitors
 - `app.py` — Streamlit chat UI, calling the FastAPI backend over HTTP, one `thread_id` per browser session
-- Tests for all five tools, the orchestrator's routing logic, the checkpointer, the summarizer, the shared graph helpers, and the FastAPI endpoints
+- `agent/guardrail.py` — classifies incoming messages as greeting/claim/out-of-scope before the main pipeline runs, using a keyword fast-path for obvious greetings and one dedicated structured-output call for everything else. Wired into `agent/orchestrator.py` as a `"guardrail"` node ahead of the tool-calling loop, so greetings and off-topic messages short-circuit to a canned reply and never trigger the forced tool pipeline
+- `agent/orchestrator_routing.py` — pure routing/decision helpers, split out of `orchestrator.py` so deterministic decision logic is easy to test in isolation
+- `agent/orchestrator_responses.py` — response-construction and cache-writing helpers (cache-hit responses, source gathering for scoring, verdict storage), also split out of `orchestrator.py`
+- Tests for all five tools, the orchestrator's routing logic, the response-construction helpers, the guardrail classification and its graph wiring, the checkpointer, the shared graph helpers, and the FastAPI endpoints
 
-Planned next: guardrails against greetings/off-topic requests, corrective re-search + authentic-source feature, human-in-the-loop review, a FastAPI multi-user layer.
+Planned next: corrective re-search + authentic-source feature, human-in-the-loop review, a FastAPI multi-user layer.
+
+`agent/summarizer.py` (context-length management — compress older, fully-resolved turns into a running summary once a thread's history crosses a message-count threshold, so long-running threads don't exceed Gemini's context window) is already built and in review on `feature/context-summarization`. It isn't in this branch's history yet, so it won't appear in a diff or file listing here until that PR merges — expect a manual conflict resolution in `agent/orchestrator.py` and `agent/config.py` when it does, since this branch restructures the same files independently.
 
 ## Architecture
 
 - **Orchestrator** — a single LangGraph agent, not a multi-agent supervisor setup. One model, multiple tools underneath.
 - **Tools** — each tool returns a structured dict, not raw text, so the orchestrator can reason over results reliably.
 - **Persistence** — Postgres (Neon), via `agent/checkpointer.py`. `build_orchestrator()` takes the checkpointer as an injected argument rather than constructing one itself, so tests can pass `InMemorySaver` without touching a real database.
-- **Context management** — `agent/summarizer.py`, wired in as a `"summarize"` graph node reached via a conditional edge off `START`. Self-limiting: once it runs, older-message count drops back below threshold until enough new messages accumulate again.
 - **Serving layer** — `graph.py` holds the shared build+invoke logic; `main.py` (FastAPI) and `cli.py` both use it directly; `app.py` (Streamlit) talks to `main.py` over HTTP instead of importing the graph logic directly.
 
 ## Setup
@@ -109,8 +112,10 @@ cli.py                         # manual CLI entry point for one-off testing
 agent/
 config.py                      # env var loading, logging setup
 checkpointer.py                # Postgres (Neon) checkpointer factory
-orchestrator.py                # LangGraph StateGraph, tool-calling loop, routing logic
-summarizer.py                  # conversation summarization for long-running threads
+orchestrator.py                # LangGraph StateGraph: graph wiring, guardrail node, tool-calling loop
+orchestrator_routing.py        # pure routing/decision helpers
+orchestrator_responses.py      # response-construction and cache-writing helpers
+guardrail.py                   # message intent classification (greeting/claim/out-of-scope)
 tools/
 _clients.py                    # shared third-party API clients
 credibility_scoring_tool.py     # Gemini-backed source-reliability judgment
@@ -123,10 +128,12 @@ test_checkpointer.py
 test_credibility_scoring_tool.py
 test_fact_check_tool.py
 test_graph.py
+test_guardrail.py
+test_guardrail_routing.py
 test_main.py
 test_orchestrator_build.py
+test_orchestrator_responses.py
 test_orchestrator_routing.py
 test_source_retrieval_tool.py
-test_summarizer.py
 test_vector_lookup_tool.py
 test_web_search_tool.py
