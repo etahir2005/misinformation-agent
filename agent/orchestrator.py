@@ -78,6 +78,14 @@ def _current_turn_messages(state: MessagesState) -> list:
     history (caught in PR review: this was previously unscoped, and a
     cache hit from an earlier claim would incorrectly short-circuit every
     later claim in the same thread).
+
+    Caveat: on a thread's first summarization, the new summary SystemMessage
+    can end up merged in after the current turn's HumanMessage rather than
+    before it (see the note in summarize_node), so this function's result
+    can briefly include that stray message too. Harmless today since every
+    caller below filters by concrete message type rather than trusting this
+    function to return purely current-turn activity — but worth keeping in
+    mind before adding a new turn-scoped helper that doesn't.
     """
     messages = state["messages"]
     for index in range(len(messages) - 1, -1, -1):
@@ -114,11 +122,16 @@ def _format_messages_for_summary(messages: list) -> str:
     Deliberately simple (role + text content only) — the summarization
     model needs what was asked and concluded, not tool-call machinery.
     Skips the stored summary placeholder itself (passed separately as
-    existing_summary) and any message with empty content.
+    existing_summary), raw ToolMessage results (the JSON payloads tools
+    return — source URLs, snippets, confidence scores — are exactly the
+    "machinery" this function exists to leave out, not substance worth
+    summarizing), and any message with empty content.
     """
     lines = []
     for message in messages:
         if getattr(message, "id", None) == _SUMMARY_MESSAGE_ID:
+            continue
+        if isinstance(message, ToolMessage):
             continue
         content = message.content if isinstance(message.content, str) else str(message.content)
         if not content.strip():
@@ -398,6 +411,13 @@ def summarize_node(state: MessagesState) -> dict:
         # than delete messages with nothing to replace them with.
         return {"messages": []}
 
+    # Note: on this thread's *first* summarization there's no existing
+    # message with _SUMMARY_MESSAGE_ID for add_messages to replace in
+    # place, so this new summary_message gets appended to the end of the
+    # merged list rather than positioned before the current turn's
+    # HumanMessage — see the caveat on _current_turn_messages. Later
+    # summarizations don't have this issue: replacing an existing id keeps
+    # its original index.
     removals = [RemoveMessage(id=message.id) for message in older_messages]
     summary_message = SystemMessage(content=new_summary_text, id=_SUMMARY_MESSAGE_ID)
     return {"messages": removals + [summary_message]}

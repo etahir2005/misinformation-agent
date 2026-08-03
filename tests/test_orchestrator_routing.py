@@ -613,6 +613,31 @@ def test_format_messages_for_summary_skips_summary_placeholder() -> None:
     assert "AI: Yes, the sky is blue." in formatted
 
 
+def test_format_messages_for_summary_skips_tool_messages() -> None:
+    """Raw ToolMessage results should never reach the summarization prompt.
+
+    Regression test for a bug caught in review: the function's docstring
+    claimed tool-call machinery was excluded, but nothing actually filtered
+    ToolMessage — only the summary placeholder and empty-content messages
+    were skipped, so a real tool result's JSON payload (source URLs,
+    snippets, confidence scores) rendered straight into the output.
+    """
+    messages = [
+        HumanMessage(content="Is the sky blue?"),
+        AIMessage(content="", tool_calls=[{"name": "web_search_tool", "args": {}, "id": "c1"}]),
+        _tool_message(
+            "web_search_tool",
+            {"sources": [{"url": "https://example.com/sky", "snippet": "The sky is blue."}]},
+        ),
+        AIMessage(content="Yes, the sky is blue."),
+    ]
+    formatted = _format_messages_for_summary(messages)
+    assert "https://example.com/sky" not in formatted
+    assert "Tool:" not in formatted
+    assert "Human: Is the sky blue?" in formatted
+    assert "AI: Yes, the sky is blue." in formatted
+
+
 def test_needs_summary_false_below_threshold() -> None:
     """_needs_summary should route to the orchestrator when older history is short."""
     state = {
