@@ -97,6 +97,20 @@ CREDIBILITY_SCORING_PROMPT: str = (
     "whether the source happens to agree with what you'd expect."
 )
 
+GUARDRAIL_PROMPT: str = (
+    "Classify the user's message into exactly one category.\n\n"
+    "\"claim\" — the message contains a specific, checkable factual "
+    "assertion about the world, a request to fact-check something, or a "
+    "URL to an article to evaluate.\n\n"
+    "\"greeting\" — the message is only a greeting or pleasantry with no "
+    "factual content (e.g. \"hi\", \"how are you\").\n\n"
+    "\"out_of_scope\" — anything else: general conversation, requests "
+    "unrelated to fact-checking (writing, math, translation, opinions, "
+    "personal questions), or messages with no checkable claim at all.\n\n"
+    "When in doubt between \"claim\" and \"out_of_scope\", prefer "
+    "\"claim\" — it's safer to run a real check than to wrongly refuse one."
+)
+
 SUMMARIZATION_PROMPT: str = (
     "You maintain a running summary of an ongoing fact-checking conversation "
     "so it can continue across many claims without resending the entire "

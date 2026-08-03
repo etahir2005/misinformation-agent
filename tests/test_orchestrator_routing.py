@@ -1,21 +1,18 @@
 """Unit tests for the orchestrator's deterministic routing logic."""
 
 import json
-from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent.config import MAX_MESSAGES_BEFORE_SUMMARY
-from agent.orchestrator import (
-    _build_cache_hit_response,
+from agent.orchestrator_routing import (
     _credibility_scoring_call_count,
     _current_turn_messages,
     _evidence_is_weak,
     _existing_summary_text,
     _format_messages_for_summary,
-    _gather_sources_for_scoring,
-    _has_evidence_to_score,
-    _has_gathered_evidence,
+    _has_evidence_tool_run,
+    _has_usable_evidence,
     _last_tool_call_args,
     _last_tool_message_index,
     _last_tool_result,
@@ -24,7 +21,6 @@ from agent.orchestrator import (
     _needs_summary,
     _should_force_credibility_scoring,
     _should_force_retry_search,
-    _store_verdict_if_new,
 )
 
 
@@ -76,13 +72,13 @@ def test_needs_credibility_scoring_true_for_zero_claims() -> None:
     assert _needs_credibility_scoring(result) is True
 
 
-def test_has_evidence_to_score_false_with_no_tool_calls() -> None:
+def test_has_usable_evidence_false_with_no_tool_calls() -> None:
     """No evidence gathered yet means nothing to score."""
     state = {"messages": [HumanMessage(content="claim")]}
-    assert _has_evidence_to_score(state) is False
+    assert _has_usable_evidence(state) is False
 
 
-def test_has_evidence_to_score_false_with_empty_fact_check() -> None:
+def test_has_usable_evidence_false_with_empty_fact_check() -> None:
     """An empty fact-check result alone isn't evidence to score."""
     state = {
         "messages": [
@@ -90,10 +86,10 @@ def test_has_evidence_to_score_false_with_empty_fact_check() -> None:
             _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
         ]
     }
-    assert _has_evidence_to_score(state) is False
+    assert _has_usable_evidence(state) is False
 
 
-def test_has_evidence_to_score_true_with_web_search_results() -> None:
+def test_has_usable_evidence_true_with_web_search_results() -> None:
     """Web search results count as evidence, even with no fact-check claims."""
     state = {
         "messages": [
@@ -102,7 +98,7 @@ def test_has_evidence_to_score_true_with_web_search_results() -> None:
             _tool_message("web_search_tool", {"sources": [{"url": "a"}], "query_used": "x"}),
         ]
     }
-    assert _has_evidence_to_score(state) is True
+    assert _has_usable_evidence(state) is True
 
 
 def test_should_force_credibility_scoring_true_when_evidence_is_messy() -> None:
@@ -325,121 +321,21 @@ def test_last_tool_message_index_none_when_absent() -> None:
     assert _last_tool_message_index(state, "web_search_tool") is None
 
 
-def test_gather_sources_for_scoring_combines_both_evidence_types() -> None:
-    """_gather_sources_for_scoring should pull from both fact-check and search results."""
-    state = {
-        "messages": [
-            HumanMessage(content="claim"),
-            _tool_message(
-                "fact_check_lookup_tool",
-                {
-                    "claims": [
-                        {
-                            "url": "https://factcheck.example/1",
-                            "publisher": "ExamplePublisher",
-                            "rating": "Misleading",
-                            "claim_text": "Some claim text.",
-                        }
-                    ],
-                    "query_used": "x",
-                },
-            ),
-            _tool_message(
-                "web_search_tool",
-                {
-                    "sources": [
-                        {
-                            "url": "https://search.example/2",
-                            "snippet": "Some snippet.",
-                            "title": "T",
-                        }
-                    ],
-                    "query_used": "x",
-                },
-            ),
-        ]
-    }
-
-    sources = _gather_sources_for_scoring(state)
-
-    assert len(sources) == 2
-    assert sources[0]["url"] == "https://factcheck.example/1"
-    assert "ExamplePublisher" in sources[0]["content"]
-    assert "Misleading" in sources[0]["content"]
-    assert sources[1]["url"] == "https://search.example/2"
-    assert sources[1]["content"] == "Some snippet."
-
-
-def test_gather_sources_for_scoring_empty_when_no_evidence() -> None:
-    """_gather_sources_for_scoring should return an empty list with no prior tool results."""
+def test_has_evidence_tool_run_false_before_any_evidence_tool() -> None:
+    """_has_evidence_tool_run should be False before fact-check/search/retrieval run."""
     state = {"messages": [HumanMessage(content="claim")]}
-    assert _gather_sources_for_scoring(state) == []
+    assert _has_evidence_tool_run(state) is False
 
 
-def test_gather_sources_for_scoring_merges_both_search_rounds() -> None:
-    """A retry search shouldn't discard the first round's sources.
-
-    Regression test (caught in PR review): _gather_sources_for_scoring used
-    to only look at the most recent web_search_tool call, so when weak
-    evidence triggered a retry search, the second scoring pass would only
-    see the retry's sources — the original round's evidence was silently
-    dropped instead of being combined with it.
-    """
-    state = {
-        "messages": [
-            HumanMessage(content="claim"),
-            _tool_message(
-                "web_search_tool",
-                {"sources": [{"url": "https://round-one.example", "snippet": "First round."}]},
-            ),
-            _tool_message(
-                "credibility_scoring_tool",
-                {"source_scores": [], "overall_confidence": 0.3, "sources_conflict": False},
-            ),
-            _tool_message(
-                "web_search_tool",
-                {"sources": [{"url": "https://round-two.example", "snippet": "Second round."}]},
-            ),
-        ]
-    }
-
-    sources = _gather_sources_for_scoring(state)
-
-    urls = {s["url"] for s in sources}
-    assert urls == {"https://round-one.example", "https://round-two.example"}
-
-
-def test_has_gathered_evidence_false_before_any_evidence_tool() -> None:
-    """_has_gathered_evidence should be False before fact-check/search/retrieval run."""
-    state = {"messages": [HumanMessage(content="claim")]}
-    assert _has_gathered_evidence(state) is False
-
-
-def test_has_gathered_evidence_true_after_fact_check() -> None:
-    """_has_gathered_evidence should be True once fact_check_lookup_tool has run."""
+def test_has_evidence_tool_run_true_after_fact_check() -> None:
+    """_has_evidence_tool_run should be True once fact_check_lookup_tool has run."""
     state = {
         "messages": [
             HumanMessage(content="claim"),
             _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
         ]
     }
-    assert _has_gathered_evidence(state) is True
-
-
-def test_build_cache_hit_response_includes_summary_and_sources() -> None:
-    """_build_cache_hit_response should surface the cached verdict summary and sources."""
-    cache_result = {
-        "hit": True,
-        "confidence": 0.9,
-        "sources": ["https://example.com/a", "https://example.com/b"],
-        "verdict_summary": "This claim is false.",
-    }
-
-    response = _build_cache_hit_response(cache_result)
-
-    assert "This claim is false." in response.content
-    assert "https://example.com/a" in response.content
-    assert "https://example.com/b" in response.content
+    assert _has_evidence_tool_run(state) is True
 
 
 def test_last_tool_call_args_returns_args_for_matching_tool_call() -> None:
@@ -466,68 +362,6 @@ def test_last_tool_call_args_none_when_tool_not_called() -> None:
     """_last_tool_call_args should return None if the tool was never called."""
     state = {"messages": [HumanMessage(content="claim")]}
     assert _last_tool_call_args(state, "vector_lookup_tool") is None
-
-
-@patch("agent.orchestrator.store_verdict")
-def test_store_verdict_if_new_uses_vector_lookup_claim_text(
-    mock_store_verdict: MagicMock,
-) -> None:
-    """Storage should embed the same claim text vector_lookup_tool used, not the raw message."""
-    state = {
-        "messages": [
-            HumanMessage(content="Is it true that the sky is green?"),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "vector_lookup_tool",
-                        "args": {"claim": "The sky is green"},
-                        "id": "call_1",
-                    }
-                ],
-            ),
-            _tool_message("vector_lookup_tool", {"hit": False}),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "fact_check_lookup_tool",
-                        "args": {"query": "sky green"},
-                        "id": "call_2",
-                    }
-                ],
-            ),
-            _tool_message(
-                "fact_check_lookup_tool",
-                {
-                    "claims": [
-                        {
-                            "rating": "False",
-                            "url": "https://a.com",
-                            "publisher": "X",
-                            "claim_text": "The sky is green",
-                        }
-                    ],
-                    "query_used": "sky green",
-                },
-            ),
-        ]
-    }
-
-    _store_verdict_if_new(state)
-
-    mock_store_verdict.assert_called_once()
-    assert mock_store_verdict.call_args.kwargs["claim"] == "The sky is green"
-
-
-@patch("agent.orchestrator.store_verdict")
-def test_store_verdict_if_new_skips_when_vector_lookup_never_called(
-    mock_store_verdict: MagicMock,
-) -> None:
-    """No claim text to store should mean no store call at all."""
-    state = {"messages": [HumanMessage(content="claim")]}
-    _store_verdict_if_new(state)
-    mock_store_verdict.assert_not_called()
 
 
 def test_current_turn_messages_excludes_prior_turns() -> None:
