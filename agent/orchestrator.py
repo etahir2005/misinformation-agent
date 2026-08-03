@@ -4,7 +4,7 @@ import logging
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -17,12 +17,18 @@ from agent.orchestrator_responses import (
     _store_verdict_if_new,
 )
 from agent.orchestrator_routing import (
+    _SUMMARY_MESSAGE_ID,
     _current_turn_messages,
+    _existing_summary_text,
+    _format_messages_for_summary,
     _has_evidence_tool_run,
     _last_tool_result,
+    _messages_before_current_turn,
+    _needs_summary,
     _should_force_credibility_scoring,
     _should_force_retry_search,
 )
+from agent.summarizer import summarize
 from agent.tools.credibility_scoring_tool import credibility_scoring_tool
 from agent.tools.fact_check_tool import fact_check_lookup_tool
 from agent.tools.source_retrieval_tool import source_retrieval_tool
@@ -83,8 +89,44 @@ def guardrail_node(state: OrchestratorState) -> dict:
 
 
 def route_after_guardrail(state: OrchestratorState) -> str:
-    """Send greetings/out-of-scope straight to END; claims continue to orchestrator."""
-    return "orchestrator" if state["intent_category"] == "claim" else END
+    """Send greetings/out-of-scope straight to END; claims continue on to
+    either the summarize node (if older history has crossed the threshold)
+    or straight to the orchestrator.
+    """
+    if state["intent_category"] != "claim":
+        return END
+    return _needs_summary(state)
+
+
+def summarize_node(state: MessagesState) -> dict:
+    """Compress older, fully-resolved turns into a single running summary message.
+
+    Only reached when _needs_summary (via route_after_guardrail) routes
+    here. Removes every message before the current turn (including any
+    prior summary placeholder) and replaces them with one updated
+    SystemMessage holding the new summary — never touches the turn
+    currently in progress.
+    """
+    older_messages = _messages_before_current_turn(state)
+    existing_summary = _existing_summary_text(older_messages)
+    conversation_text = _format_messages_for_summary(older_messages)
+
+    new_summary_text = summarize(existing_summary, conversation_text)
+    if new_summary_text is None:
+        # Summarization failed — leave history untouched this turn rather
+        # than delete messages with nothing to replace them with.
+        return {"messages": []}
+
+    # Note: on this thread's *first* summarization there's no existing
+    # message with _SUMMARY_MESSAGE_ID for add_messages to replace in
+    # place, so this new summary_message gets appended to the end of the
+    # merged list rather than positioned before the current turn's
+    # HumanMessage — see the caveat on _current_turn_messages in
+    # orchestrator_routing.py. Later summarizations don't have this issue:
+    # replacing an existing id keeps its original index.
+    removals = [RemoveMessage(id=message.id) for message in older_messages]
+    summary_message = SystemMessage(content=new_summary_text, id=_SUMMARY_MESSAGE_ID)
+    return {"messages": removals + [summary_message]}
 
 
 def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
@@ -119,7 +161,23 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
         # Gemini itself still sees the full thread history, not just the
         # current turn — that's what gives it multi-turn conversational
         # context. Only the deterministic routing above is turn-scoped.
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        # If older history has been summarized, fold that summary into the
+        # system prompt (one combined SystemMessage, not two separate
+        # ones — safer across chat-model integrations) and exclude the raw
+        # stored placeholder from what's actually sent.
+        summary_text = _existing_summary_text(state["messages"])
+        system_prompt = SYSTEM_PROMPT
+        if summary_text:
+            system_prompt = (
+                f"{SYSTEM_PROMPT}\n\nSummary of earlier claims already "
+                f"discussed in this thread:\n{summary_text}"
+            )
+        sendable_messages = [
+            message
+            for message in state["messages"]
+            if getattr(message, "id", None) != _SUMMARY_MESSAGE_ID
+        ]
+        messages = [SystemMessage(content=system_prompt)] + sendable_messages
 
         if cache_result is None:
             model_to_use = model_forced_cache_check
@@ -145,11 +203,13 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
 
     builder = StateGraph(OrchestratorState)
     builder.add_node("guardrail", guardrail_node)
+    builder.add_node("summarize", summarize_node)
     builder.add_node("orchestrator", call_model)
     builder.add_node("tools", ToolNode(TOOLS))
 
     builder.add_edge(START, "guardrail")
     builder.add_conditional_edges("guardrail", route_after_guardrail)
+    builder.add_edge("summarize", "orchestrator")
     builder.add_conditional_edges("orchestrator", tools_condition)
     builder.add_edge("tools", "orchestrator")
 

@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 import main
+from agent.guardrail import MessageIntent
 
 
 @pytest.fixture(autouse=True)
@@ -20,18 +21,25 @@ def disable_api_key(monkeypatch):
 def client():
     """A TestClient wired to a real graph (InMemorySaver), chat model mocked.
 
-    Patches init_chat_model (no real Gemini call) and main.build_checkpointer
-    (no real Postgres connection) — patched where they're used (in main's and
-    orchestrator's namespaces), same convention already used throughout this
-    codebase's tests.
+    Patches init_chat_model (no real Gemini call), the guardrail's own
+    separate classification model (no real Gemini call there either — every
+    request goes through guardrail_node before anything else now), and
+    main.build_checkpointer (no real Postgres connection) — patched where
+    they're used (in main's, orchestrator's, and guardrail's namespaces),
+    same convention already used throughout this codebase's tests. Without
+    the guardrail patch, every /chat request in these tests would silently
+    fall through to a real, unmocked Gemini call for intent classification.
     """
     mock_model = MagicMock()
     mock_model.bind_tools.return_value = mock_model
     mock_model.invoke.return_value = AIMessage(content="Final answer.")
 
-    with patch("agent.orchestrator.init_chat_model", return_value=mock_model), patch(
+    with patch(
+        "agent.orchestrator.init_chat_model", return_value=mock_model
+    ), patch("agent.guardrail._get_intent_model") as mock_get_intent_model, patch(
         "main.build_checkpointer"
     ) as mock_build_checkpointer:
+        mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
         mock_build_checkpointer.return_value.__enter__.return_value = InMemorySaver()
         mock_build_checkpointer.return_value.__exit__.return_value = False
 
@@ -75,9 +83,12 @@ def test_chat_flattens_list_style_message_content() -> None:
         content=[{"type": "text", "text": "Final answer."}]
     )
 
-    with patch("agent.orchestrator.init_chat_model", return_value=mock_model), patch(
+    with patch(
+        "agent.orchestrator.init_chat_model", return_value=mock_model
+    ), patch("agent.guardrail._get_intent_model") as mock_get_intent_model, patch(
         "main.build_checkpointer"
     ) as mock_build_checkpointer, patch.object(main, "API_ACCESS_KEY", None):
+        mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
         mock_build_checkpointer.return_value.__enter__.return_value = InMemorySaver()
         mock_build_checkpointer.return_value.__exit__.return_value = False
 

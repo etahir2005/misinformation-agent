@@ -7,11 +7,16 @@ file mixing all three.
 """
 
 import json
+from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import MessagesState
 
-from agent.config import LOW_CONFIDENCE_THRESHOLD
+from agent.config import LOW_CONFIDENCE_THRESHOLD, MAX_MESSAGES_BEFORE_SUMMARY
+
+# Fixed id so the stored summary message can be found, replaced, and
+# excluded from what actually gets sent to Gemini — never rely on position.
+_SUMMARY_MESSAGE_ID = "conversation-summary"
 
 # Real fact-checker rating text is inconsistent across publishers (Snopes,
 # PolitiFact, Reuters, etc. all use their own wording), so this can't be an
@@ -45,6 +50,14 @@ def _current_turn_messages(state: MessagesState) -> list:
     history (caught in PR review: this was previously unscoped, and a
     cache hit from an earlier claim would incorrectly short-circuit every
     later claim in the same thread).
+
+    Caveat: on a thread's first summarization, the new summary SystemMessage
+    can end up merged in after the current turn's HumanMessage rather than
+    before it (see the note in summarize_node), so this function's result
+    can briefly include that stray message too. Harmless today since every
+    caller below filters by concrete message type rather than trusting this
+    function to return purely current-turn activity — but worth keeping in
+    mind before adding a new turn-scoped helper that doesn't.
     """
     messages = state["messages"]
     for index in range(len(messages) - 1, -1, -1):
@@ -205,3 +218,65 @@ def _should_force_retry_search(state: MessagesState) -> bool:
         return False
 
     return True
+
+
+def _messages_before_current_turn(state: MessagesState) -> list:
+    """Return every message before the most recent HumanMessage.
+
+    The complement of _current_turn_messages — used only for summarization,
+    which must never touch the turn currently in progress (the model still
+    needs that context intact to finish resolving the current claim).
+    """
+    messages = state["messages"]
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            return messages[:index]
+    return []
+
+
+def _existing_summary_text(messages: list) -> str | None:
+    """Return the stored running summary's text, if one exists in this message list."""
+    for message in messages:
+        if getattr(message, "id", None) == _SUMMARY_MESSAGE_ID:
+            return message.content
+    return None
+
+
+def _format_messages_for_summary(messages: list) -> str:
+    """Render messages as plain text for the summarization prompt.
+
+    Deliberately simple (role + text content only) — the summarization
+    model needs what was asked and concluded, not tool-call machinery.
+    Skips the stored summary placeholder itself (passed separately as
+    existing_summary), raw ToolMessage results (the JSON payloads tools
+    return — source URLs, snippets, confidence scores — are exactly the
+    "machinery" this function exists to leave out, not substance worth
+    summarizing), and any message with empty content.
+    """
+    lines = []
+    for message in messages:
+        if getattr(message, "id", None) == _SUMMARY_MESSAGE_ID:
+            continue
+        if isinstance(message, ToolMessage):
+            continue
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        if not content.strip():
+            continue
+        role = message.__class__.__name__.replace("Message", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _needs_summary(state: MessagesState) -> Literal["summarize", "orchestrator"]:
+    """Route to the summarize node only once older history crosses the threshold.
+
+    Checked once at the very start of each turn, right after the guardrail
+    (see route_after_guardrail). Self-limiting: once summarize_node runs,
+    the older-message count drops back down to just the one summary
+    placeholder, so this won't fire again until enough new messages
+    accumulate.
+    """
+    older_messages = _messages_before_current_turn(state)
+    if len(older_messages) >= MAX_MESSAGES_BEFORE_SUMMARY:
+        return "summarize"
+    return "orchestrator"

@@ -104,3 +104,44 @@ def test_different_thread_ids_have_independent_history(
 
     assert len(human_messages_b) == 1
     assert human_messages_b[0].content == "Thread B claim."
+
+
+@patch("agent.guardrail._get_intent_model")
+@patch("agent.orchestrator.summarize")
+@patch("agent.orchestrator.init_chat_model")
+def test_long_thread_triggers_summarization(
+    mock_init_chat_model: MagicMock,
+    mock_summarize: MagicMock,
+    mock_get_intent_model: MagicMock,
+) -> None:
+    """Once a thread's older history crosses the threshold, it gets summarized and shrunk."""
+    from agent.config import MAX_MESSAGES_BEFORE_SUMMARY
+
+    mock_init_chat_model.return_value = _mock_model_returning("Answer.")
+    mock_summarize.return_value = "Summary of everything discussed so far."
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
+
+    graph = build_orchestrator(InMemorySaver())
+    config = {"configurable": {"thread_id": "long-thread"}}
+
+    # Each invoke() adds one HumanMessage + one AIMessage (no tool calls,
+    # per the mocked model) — enough turns to push the older-message count
+    # well past MAX_MESSAGES_BEFORE_SUMMARY. Deliberately generous (not just
+    # enough to clear the threshold on the last iteration) — LangGraph's
+    # exact timing of when a turn's new message becomes visible to the
+    # START routing check vs. downstream nodes isn't something this test
+    # should be tightly coupled to.
+    num_turns = MAX_MESSAGES_BEFORE_SUMMARY + 6
+    for i in range(num_turns):
+        graph.invoke({"messages": [HumanMessage(content=f"claim {i}")]}, config=config)
+
+    mock_summarize.assert_called()
+
+    state = graph.get_state(config)
+    messages = state.values["messages"]
+    summary_messages = [m for m in messages if getattr(m, "id", None) == "conversation-summary"]
+
+    assert len(summary_messages) == 1
+    assert summary_messages[0].content == "Summary of everything discussed so far."
+    # Older raw messages should have been removed, not just accumulated.
+    assert len(messages) < num_turns * 2

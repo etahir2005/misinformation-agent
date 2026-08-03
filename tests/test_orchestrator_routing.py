@@ -2,18 +2,23 @@
 
 import json
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from agent.config import MAX_MESSAGES_BEFORE_SUMMARY
 from agent.orchestrator_routing import (
     _credibility_scoring_call_count,
     _current_turn_messages,
     _evidence_is_weak,
+    _existing_summary_text,
+    _format_messages_for_summary,
     _has_evidence_tool_run,
     _has_usable_evidence,
     _last_tool_call_args,
     _last_tool_message_index,
     _last_tool_result,
+    _messages_before_current_turn,
     _needs_credibility_scoring,
+    _needs_summary,
     _should_force_credibility_scoring,
     _should_force_retry_search,
 )
@@ -384,3 +389,105 @@ def test_current_turn_messages_returns_all_when_no_human_message() -> None:
     """_current_turn_messages should fall back to the full list if no HumanMessage exists."""
     state = {"messages": [_tool_message("web_search_tool", {"sources": [], "query_used": "x"})]}
     assert _current_turn_messages(state) == state["messages"]
+
+
+def test_messages_before_current_turn_excludes_current_turn() -> None:
+    """_messages_before_current_turn should be the exact complement of _current_turn_messages."""
+    state = {
+        "messages": [
+            HumanMessage(content="first claim"),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+            _tool_message("fact_check_lookup_tool", {"claims": [], "query_used": "x"}),
+            HumanMessage(content="second claim"),
+        ]
+    }
+    older_messages = _messages_before_current_turn(state)
+    assert len(older_messages) == 3
+    assert older_messages[0].content == "first claim"
+
+
+def test_messages_before_current_turn_empty_on_first_turn() -> None:
+    """With only one HumanMessage in the thread, there's nothing older to summarize yet."""
+    state = {"messages": [HumanMessage(content="only claim so far")]}
+    assert _messages_before_current_turn(state) == []
+
+
+def test_existing_summary_text_finds_stored_summary() -> None:
+    """_existing_summary_text should return the stored summary's content, found by fixed id."""
+    messages = [
+        SystemMessage(content="Earlier claims summarized here.", id="conversation-summary"),
+        HumanMessage(content="a new claim"),
+    ]
+    assert _existing_summary_text(messages) == "Earlier claims summarized here."
+
+
+def test_existing_summary_text_none_when_absent() -> None:
+    """_existing_summary_text should return None when no summary has been stored yet."""
+    messages = [HumanMessage(content="a claim"), _tool_message("web_search_tool", {"sources": []})]
+    assert _existing_summary_text(messages) is None
+
+
+def test_format_messages_for_summary_skips_summary_placeholder() -> None:
+    """The summary placeholder itself and empty-content messages should be excluded.
+
+    The placeholder is passed separately as existing_summary — including it
+    again in conversation_text would duplicate it in the summarization
+    prompt. Tool-call-only AIMessages (empty content) add no readable
+    substance either.
+    """
+    messages = [
+        SystemMessage(content="Old summary text.", id="conversation-summary"),
+        HumanMessage(content="Is the sky blue?"),
+        AIMessage(content="", tool_calls=[{"name": "vector_lookup_tool", "args": {}, "id": "c1"}]),
+        AIMessage(content="Yes, the sky is blue."),
+    ]
+    formatted = _format_messages_for_summary(messages)
+    assert "Old summary text." not in formatted
+    assert "Human: Is the sky blue?" in formatted
+    assert "AI: Yes, the sky is blue." in formatted
+
+
+def test_format_messages_for_summary_skips_tool_messages() -> None:
+    """Raw ToolMessage results should never reach the summarization prompt.
+
+    Regression test for a bug caught in review: the function's docstring
+    claimed tool-call machinery was excluded, but nothing actually filtered
+    ToolMessage — only the summary placeholder and empty-content messages
+    were skipped, so a real tool result's JSON payload (source URLs,
+    snippets, confidence scores) rendered straight into the output.
+    """
+    messages = [
+        HumanMessage(content="Is the sky blue?"),
+        AIMessage(content="", tool_calls=[{"name": "web_search_tool", "args": {}, "id": "c1"}]),
+        _tool_message(
+            "web_search_tool",
+            {"sources": [{"url": "https://example.com/sky", "snippet": "The sky is blue."}]},
+        ),
+        AIMessage(content="Yes, the sky is blue."),
+    ]
+    formatted = _format_messages_for_summary(messages)
+    assert "https://example.com/sky" not in formatted
+    assert "Tool:" not in formatted
+    assert "Human: Is the sky blue?" in formatted
+    assert "AI: Yes, the sky is blue." in formatted
+
+
+def test_needs_summary_false_below_threshold() -> None:
+    """_needs_summary should route to the orchestrator when older history is short."""
+    state = {
+        "messages": [
+            HumanMessage(content="first claim"),
+            AIMessage(content="answer"),
+            HumanMessage(content="second claim"),
+        ]
+    }
+    assert _needs_summary(state) == "orchestrator"
+
+
+def test_needs_summary_true_at_threshold() -> None:
+    """_needs_summary should route to summarize once older history hits the configured max."""
+    older_messages = [
+        HumanMessage(content=f"claim {i}") for i in range(MAX_MESSAGES_BEFORE_SUMMARY)
+    ]
+    state = {"messages": older_messages + [HumanMessage(content="current claim")]}
+    assert _needs_summary(state) == "summarize"
