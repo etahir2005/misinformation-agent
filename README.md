@@ -16,30 +16,37 @@ Early build in progress. Currently implemented:
 - First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
 - Postgres-backed persistence (Neon) via `agent/checkpointer.py` — conversation state survives restarts, keyed by thread_id. The checkpointer is injected into `build_orchestrator()` rather than hardcoded, so tests still use `InMemorySaver`
-- Tests for all five tools, the orchestrator's routing logic, and the checkpointer
+- `graph.py` — shared graph-building and invocation logic, used by both the FastAPI app and the CLI script
+- `main.py` — FastAPI app wrapping the graph, with a `/chat` endpoint and a `/health` check. Checkpointer is opened once at startup via `lifespan`, not per request. `/chat` requires an `X-API-Key` header matching `API_ACCESS_KEY` (the app refuses to start without it set) — `/health` stays open for uptime monitors
+- `app.py` — Streamlit chat UI, calling the FastAPI backend over HTTP, one `thread_id` per browser session
+- `agent/guardrail.py` — classifies incoming messages as greeting/claim/out-of-scope before the main pipeline runs, using a keyword fast-path for obvious greetings and one dedicated structured-output call for everything else. Wired into `agent/orchestrator.py` as a `"guardrail"` node ahead of the tool-calling loop, so greetings and off-topic messages short-circuit to a canned reply and never trigger the forced tool pipeline
+- `agent/orchestrator_routing.py` — pure routing/decision helpers, split out of `orchestrator.py` so deterministic decision logic is easy to test in isolation
+- `agent/orchestrator_responses.py` — response-construction and cache-writing helpers (cache-hit responses, source gathering for scoring, verdict storage), also split out of `orchestrator.py`
+- Tests for all five tools, the orchestrator's routing logic, the response-construction helpers, the guardrail classification and its graph wiring, the checkpointer, the shared graph helpers, and the FastAPI endpoints
 
-Planned next: corrective re-search + authentic-source feature, context-length handling for long-running threads, human-in-the-loop review, a Streamlit UI, and a FastAPI layer.
+Planned next: corrective re-search + authentic-source feature, human-in-the-loop review, a FastAPI multi-user layer.
+
+`agent/summarizer.py` (context-length management — compress older, fully-resolved turns into a running summary once a thread's history crosses a message-count threshold, so long-running threads don't exceed Gemini's context window) is already built and in review on `feature/context-summarization`. It isn't in this branch's history yet, so it won't appear in a diff or file listing here until that PR merges — expect a manual conflict resolution in `agent/orchestrator.py` and `agent/config.py` when it does, since this branch restructures the same files independently.
 
 ## Architecture
 
 - **Orchestrator** — a single LangGraph agent, not a multi-agent supervisor setup. One model, multiple tools underneath.
 - **Tools** — each tool returns a structured dict, not raw text, so the orchestrator can reason over results reliably.
 - **Persistence** — Postgres (Neon), via `agent/checkpointer.py`. `build_orchestrator()` takes the checkpointer as an injected argument rather than constructing one itself, so tests can pass `InMemorySaver` without touching a real database.
+- **Serving layer** — `graph.py` holds the shared build+invoke logic; `main.py` (FastAPI) and `cli.py` both use it directly; `app.py` (Streamlit) talks to `main.py` over HTTP instead of importing the graph logic directly.
 
 ## Setup
 
-1. Create a virtual environment:
+1. Install Miniconda from anaconda.com/download, then create and activate the environment:
 
-```
-   python -m venv venv
-   venv\Scripts\activate
-```
+conda create -n misinformation-agent python=3.13
+conda activate misinformation-agent
+
 
 2. Install dependencies:
 
-```
-   venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+pip install -r requirements.txt
+
 
 3. Set up a Pinecone index for the semantic claim cache:
 
@@ -53,28 +60,35 @@ Planned next: corrective re-search + authentic-source feature, context-length ha
 
 5. Copy `.env.example` to `.env` and fill in your API keys:
 
-```
-   GOOGLE_API_KEY=
-   TAVILY_API_KEY=
-   GOOGLE_FACT_CHECK_API_KEY=
-   PINECONE_API_KEY=
-   PINECONE_INDEX_NAME=
-   MODEL_NAME=gemini-3.1-flash-lite
-   POSTGRES_CONNECTION_STRING=
-```
+GOOGLE_API_KEY=
+TAVILY_API_KEY=
+GOOGLE_FACT_CHECK_API_KEY=
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=
+MODEL_NAME=gemini-3.1-flash-lite
+POSTGRES_CONNECTION_STRING=
+API_ACCESS_KEY=
 
-6. Run a test claim through the agent:
 
-```
-   venv\Scripts\python.exe main.py
-```
+6. Run a test claim through the agent directly (no server needed):
+
+python cli.py
+
+
+7. Or run the full FastAPI + Streamlit stack (two terminals):
+
+# Terminal 1
+uvicorn main:app --reload --port 8000
+
+# Terminal 2
+streamlit run app.py
+
 
 ## Testing
 
-```
-venv\Scripts\python.exe -m pytest
-venv\Scripts\python.exe -m ruff check .
-```
+python -m pytest
+python -m ruff check .
+
 
 ## Tech stack
 
@@ -85,29 +99,41 @@ venv\Scripts\python.exe -m ruff check .
 - Pinecone — vector database for the semantic claim cache
 - sentence-transformers (BAAI/bge-base-en-v1.5) — local embedding model for the claim cache
 - Postgres (Neon) via `langgraph-checkpoint-postgres` / `psycopg` — conversation state persistence
+- FastAPI / uvicorn — HTTP API layer
+- Streamlit — chat UI
 - pytest, ruff — testing and linting
 
 ## Project structure
 
-```
+graph.py                       # shared graph build + invoke logic
+main.py                        # FastAPI app wrapping the graph
+app.py                         # Streamlit chat UI, calls main.py over HTTP
+cli.py                         # manual CLI entry point for one-off testing
 agent/
-  config.py                       # env var loading, logging setup
-  checkpointer.py                 # Postgres (Neon) checkpointer factory
-  orchestrator.py                 # LangGraph StateGraph, tool-calling loop, routing logic
-  tools/
-    _clients.py                    # shared third-party API clients
-    credibility_scoring_tool.py    # Gemini-backed source-reliability judgment
-    fact_check_tool.py             # Google Fact Check Tools API lookup
-    source_retrieval_tool.py       # Tavily Extract-backed full-article retrieval
-    vector_lookup_tool.py          # Pinecone-backed semantic claim cache
-    web_search_tool.py             # Tavily-backed web search tool
-main.py                            # manual end-to-end test entry point
+config.py                      # env var loading, logging setup
+checkpointer.py                # Postgres (Neon) checkpointer factory
+orchestrator.py                # LangGraph StateGraph: graph wiring, guardrail node, tool-calling loop
+orchestrator_routing.py        # pure routing/decision helpers
+orchestrator_responses.py      # response-construction and cache-writing helpers
+guardrail.py                   # message intent classification (greeting/claim/out-of-scope)
+tools/
+_clients.py                    # shared third-party API clients
+credibility_scoring_tool.py     # Gemini-backed source-reliability judgment
+fact_check_tool.py              # Google Fact Check Tools API lookup
+source_retrieval_tool.py        # Tavily Extract-backed full-article retrieval
+vector_lookup_tool.py           # Pinecone-backed semantic claim cache
+web_search_tool.py               # Tavily-backed web search tool
 tests/
-  test_checkpointer.py
-  test_credibility_scoring_tool.py
-  test_fact_check_tool.py
-  test_orchestrator_routing.py
-  test_source_retrieval_tool.py
-  test_vector_lookup_tool.py
-  test_web_search_tool.py
-```
+test_checkpointer.py
+test_credibility_scoring_tool.py
+test_fact_check_tool.py
+test_graph.py
+test_guardrail.py
+test_guardrail_routing.py
+test_main.py
+test_orchestrator_build.py
+test_orchestrator_responses.py
+test_orchestrator_routing.py
+test_source_retrieval_tool.py
+test_vector_lookup_tool.py
+test_web_search_tool.py

@@ -6,3 +6,6 @@ venv/
 .pytest_cache/
 .ruff_cache/
 main_output.txt
+.vscode/
+code_walkthrough_prep.md
+demo_script.md

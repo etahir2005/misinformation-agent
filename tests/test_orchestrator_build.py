@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from agent.guardrail import MessageIntent
 from agent.orchestrator import build_orchestrator
 
 
@@ -35,12 +36,15 @@ def _mock_model_returning(text: str) -> MagicMock:
     return mock_model
 
 
+@patch("agent.guardrail._get_intent_model")
 @patch("agent.orchestrator.init_chat_model")
 def test_build_orchestrator_compiles_and_runs_with_injected_checkpointer(
     mock_init_chat_model: MagicMock,
+    mock_get_intent_model: MagicMock,
 ) -> None:
     """build_orchestrator() should compile and produce an answer using the injected checkpointer."""
     mock_init_chat_model.return_value = _mock_model_returning("Final answer.")
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
 
     graph = build_orchestrator(InMemorySaver())
     config = {"configurable": {"thread_id": "test-thread"}}
@@ -52,10 +56,14 @@ def test_build_orchestrator_compiles_and_runs_with_injected_checkpointer(
     assert result["messages"][-1].content == "Final answer."
 
 
+@patch("agent.guardrail._get_intent_model")
 @patch("agent.orchestrator.init_chat_model")
-def test_conversation_context_persists_across_turns(mock_init_chat_model: MagicMock) -> None:
+def test_conversation_context_persists_across_turns(
+    mock_init_chat_model: MagicMock, mock_get_intent_model: MagicMock
+) -> None:
     """A second turn on the same thread_id should see the first turn's history."""
     mock_init_chat_model.return_value = _mock_model_returning("Answer.")
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
 
     graph = build_orchestrator(InMemorySaver())
     config = {"configurable": {"thread_id": "test-thread"}}
@@ -71,12 +79,14 @@ def test_conversation_context_persists_across_turns(mock_init_chat_model: MagicM
     assert human_messages[1].content == "Second claim."
 
 
+@patch("agent.guardrail._get_intent_model")
 @patch("agent.orchestrator.init_chat_model")
 def test_different_thread_ids_have_independent_history(
-    mock_init_chat_model: MagicMock,
+    mock_init_chat_model: MagicMock, mock_get_intent_model: MagicMock
 ) -> None:
     """Two different thread_ids should never see each other's conversation history."""
     mock_init_chat_model.return_value = _mock_model_returning("Answer.")
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
 
     graph = build_orchestrator(InMemorySaver())
 
