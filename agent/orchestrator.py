@@ -47,12 +47,12 @@ TOOLS = [
 
 _EVIDENCE_TOOLS = [fact_check_lookup_tool, web_search_tool, source_retrieval_tool]
 
-_GREETING_RESPONSE = AIMessage(
-    content="Hi! Send me a claim you'd like fact-checked, or a link to an "
+_GREETING_TEXT = (
+    "Hi! Send me a claim you'd like fact-checked, or a link to an "
     "article, and I'll look into it."
 )
-_OUT_OF_SCOPE_RESPONSE = AIMessage(
-    content="I'm built specifically for fact-checking claims — I can't help "
+_OUT_OF_SCOPE_TEXT = (
+    "I'm built specifically for fact-checking claims — I can't help "
     "with that, but send me something to verify and I'll get on it."
 )
 
@@ -82,9 +82,12 @@ def guardrail_node(state: OrchestratorState) -> dict:
     category = classify_message_intent(latest_message.content)
 
     if category == "greeting":
-        return {"intent_category": category, "messages": [_GREETING_RESPONSE]}
+        return {"intent_category": category, "messages": [AIMessage(content=_GREETING_TEXT)]}
     if category == "out_of_scope":
-        return {"intent_category": category, "messages": [_OUT_OF_SCOPE_RESPONSE]}
+        return {
+            "intent_category": category,
+            "messages": [AIMessage(content=_OUT_OF_SCOPE_TEXT)],
+        }
     return {"intent_category": category}
 
 
