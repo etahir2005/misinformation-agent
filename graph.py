@@ -13,6 +13,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 
 from agent.orchestrator import build_orchestrator
+from agent.tracing import get_langfuse_handler
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ def run_claim(graph, claim: str, thread_id: str) -> dict:
         "configurable": {"thread_id": thread_id},
         "recursion_limit": _MAX_TOOL_LOOP_STEPS,
     }
+    langfuse_handler = get_langfuse_handler()
+    if langfuse_handler is not None:
+        config["callbacks"] = [langfuse_handler]
+        config["metadata"] = {"langfuse_session_id": thread_id}
     try:
         result = graph.invoke({"messages": [{"role": "user", "content": claim}]}, config=config)
         return {"messages": result["messages"], "recursion_limit_hit": False}
