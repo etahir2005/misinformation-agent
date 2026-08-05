@@ -16,3 +16,6 @@ uvicorn[standard]
 streamlit
 requests
 langfuse
+argon2-cffi
+pyjwt
+pydantic[email]

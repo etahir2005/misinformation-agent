@@ -1,6 +1,5 @@
 """Streamlit chat UI for the misinformation agent — talks to the FastAPI backend over HTTP."""
 
-import os
 import uuid
 
 import requests
@@ -18,14 +17,6 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="expanded",
 )
-
-API_ACCESS_KEY = os.getenv("API_ACCESS_KEY")
-if not API_ACCESS_KEY:
-    st.error(
-        "This app is not configured correctly (missing API_ACCESS_KEY) and "
-        "cannot reach the backend right now."
-    )
-    st.stop()
 
 # Dark "investigation desk" palette, plain CSS injected via st.markdown — no
 # extra dependencies (streamlit-extras, etc.) required.
@@ -149,6 +140,69 @@ footer, header[data-testid="stHeader"] {
 
 st.markdown(_THEME_CSS, unsafe_allow_html=True)
 
+
+def _auth_request(endpoint: str, email: str, password: str) -> str | None:
+    """Call /auth/signup or /auth/login and return the access token, or None on failure.
+
+    Renders its own st.error on any failure (connection, timeout, or a 4xx
+    from the backend) so callers just check the return value instead of
+    handling three different error shapes themselves.
+    """
+    try:
+        response = requests.post(
+            f"{API_URL}/auth/{endpoint}",
+            json={"email": email, "password": password},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.RequestException:
+        st.error("Couldn't reach the backend — is the API running?")
+        return None
+    if response.status_code >= 400:
+        st.error(response.json().get("detail", "Something went wrong."))
+        return None
+    return response.json()["access_token"]
+
+
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+
+if st.session_state.access_token is None:
+    st.markdown("## 🔎 Misinformation Agent — Sign in")
+    login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            if st.form_submit_button("Log in") and email and password:
+                token = _auth_request("login", email, password)
+                if token:
+                    st.session_state.access_token = token
+                    # Reset per-session state on every (re)login — otherwise a
+                    # second person logging in on the same browser tab would
+                    # inherit the previous user's thread_id (tripping the
+                    # backend's ownership check) or see their leftover chat
+                    # bubbles.
+                    st.session_state.thread_id = str(uuid.uuid4())
+                    st.session_state.messages = []
+                    st.rerun()
+
+    with signup_tab:
+        with st.form("signup_form"):
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input(
+                "Password (min 8 characters)", type="password", key="signup_password"
+            )
+            if st.form_submit_button("Sign up") and email and password:
+                token = _auth_request("signup", email, password)
+                if token:
+                    st.session_state.access_token = token
+                    st.session_state.thread_id = str(uuid.uuid4())
+                    st.session_state.messages = []
+                    st.rerun()
+
+    st.stop()
+
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 
@@ -176,6 +230,19 @@ with st.sidebar:
     )
 
     if st.button("🗑️  New conversation", use_container_width=True):
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.rerun()
+
+    st.divider()
+
+    if st.button("🚪  Log out", use_container_width=True):
+        # Clearing access_token drops back to the login gate on rerun.
+        # thread_id/messages are also reset so that if the same or a
+        # different person logs back in on this tab, they start clean
+        # instead of inheriting this session's leftover state — same
+        # reasoning as the reset already done on login/signup above.
+        st.session_state.access_token = None
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
@@ -232,7 +299,7 @@ if claim:
                 response = requests.post(
                     f"{API_URL}/chat",
                     json={"claim": claim, "thread_id": st.session_state.thread_id},
-                    headers={"X-API-Key": API_ACCESS_KEY},
+                    headers={"Authorization": f"Bearer {st.session_state.access_token}"},
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
                 response.raise_for_status()
@@ -248,6 +315,12 @@ if claim:
             except requests.exceptions.Timeout:
                 answer = "The request took too long and timed out. Please try again."
                 banner = ("error", "⛔ Timed out")
+            except requests.exceptions.HTTPError:
+                if response.status_code in (401, 403):
+                    st.session_state.access_token = None
+                    st.rerun()
+                answer = "The request failed — please try again."
+                banner = ("error", "⛔ Request failed")
             except requests.exceptions.RequestException as exc:
                 answer = f"Something went wrong: {exc}"
                 banner = ("error", "⛔ Request failed")

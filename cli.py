@@ -12,7 +12,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from agent.checkpointer import build_checkpointer  # noqa: E402
+from agent.checkpointer import build_checkpointer, build_connection_pool  # noqa: E402
 from graph import build_graph, run_claim  # noqa: E402
 
 
@@ -20,7 +20,8 @@ def main() -> None:
     claim = "Is it true that the Great Wall of China is visible from space?"
     thread_id = str(uuid.uuid4())
 
-    with build_checkpointer() as checkpointer:
+    with build_connection_pool() as pool:
+        checkpointer = build_checkpointer(pool)
         graph = build_graph(checkpointer)
         result = run_claim(graph, claim, thread_id)
 
