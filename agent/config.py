@@ -62,6 +62,13 @@ MAX_MESSAGES_BEFORE_SUMMARY = 20
 # session-level Postgres features a transaction pooler can break.
 POSTGRES_CONNECTION_STRING: str = _require_env("POSTGRES_CONNECTION_STRING")
 
+# Langfuse tracing (optional — if unset, the app runs untraced rather than
+# refusing to start; observability shouldn't be a hard dependency the way
+# the Gemini/Tavily/Pinecone keys are).
+LANGFUSE_PUBLIC_KEY: str | None = os.getenv("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY: str | None = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
     "vector_lookup_tool to check whether a semantically similar claim has "
