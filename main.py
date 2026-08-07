@@ -15,6 +15,13 @@ from agent.auth import (
     verify_password,
 )
 from agent.checkpointer import build_checkpointer, build_connection_pool
+from agent.conversations_db import (
+    create_conversation,
+    derive_title,
+    list_conversations,
+    setup_conversations_table,
+    touch_conversation,
+)
 from agent.users_db import (
     EmailAlreadyRegisteredError,
     create_user,
@@ -87,18 +94,20 @@ def _get_thread_owner(graph, thread_id: str) -> str | None:
 async def lifespan(app: FastAPI):
     """Open one shared Postgres connection pool for the app's lifetime.
 
-    Both the checkpointer and agent/users_db.py draw from this single pool
-    (see agent/checkpointer.py) rather than a single held-open connection
-    or one connection per call — a pool detects and replaces connections
-    that Neon's free tier kills when it auto-suspends from inactivity,
-    which a single held-open connection can't recover from without an app
-    restart. setup_users_table() is idempotent (CREATE TABLE IF NOT EXISTS)
-    so it's safe to run on every startup too, same reasoning as the
-    checkpointer's own .setup() call.
+    Both the checkpointer, agent/users_db.py, and agent/conversations_db.py
+    draw from this single pool (see agent/checkpointer.py) rather than a
+    single held-open connection or one connection per call — a pool
+    detects and replaces connections that Neon's free tier kills when it
+    auto-suspends from inactivity, which a single held-open connection
+    can't recover from without an app restart. setup_users_table() and
+    setup_conversations_table() are both idempotent (CREATE TABLE IF NOT
+    EXISTS) so it's safe to run them on every startup too, same reasoning
+    as the checkpointer's own .setup() call.
     """
     with build_connection_pool() as pool:
         app.state.pool = pool
         setup_users_table(pool)
+        setup_conversations_table(pool)
         checkpointer = build_checkpointer(pool)
         app.state.graph = build_graph(checkpointer)
         logger.info("FastAPI startup complete — graph ready.")
@@ -133,6 +142,44 @@ class ChatResponse(BaseModel):
     answer: str
     thread_id: str
     recursion_limit_hit: bool
+
+
+class ConversationSummary(BaseModel):
+    thread_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+class ConversationMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ConversationHistoryResponse(BaseModel):
+    thread_id: str
+    messages: list[ConversationMessage]
+
+
+def _to_conversation_messages(raw_messages: list) -> list[ConversationMessage]:
+    """Filter a thread's full message list down to what the chat UI actually shows.
+
+    Keeps HumanMessages (user turns) and AIMessages that carry a final
+    answer (no pending tool_calls, non-empty content). Drops ToolMessages,
+    intermediate tool-calling AIMessages, and the summarizer's SystemMessage
+    placeholder — none of those are ever rendered in app.py's chat window,
+    so resuming a conversation shouldn't surface them either.
+    """
+    result: list[ConversationMessage] = []
+    for message in raw_messages:
+        role = getattr(message, "type", None)
+        if role == "human":
+            result.append(ConversationMessage(role="user", content=_extract_text(message.content)))
+        elif role == "ai" and not getattr(message, "tool_calls", None) and message.content:
+            result.append(
+                ConversationMessage(role="assistant", content=_extract_text(message.content))
+            )
+    return result
 
 
 @app.get("/health")
@@ -182,7 +229,9 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
     A provided thread_id must belong to the authenticated user — reusing
     someone else's thread_id is rejected with 403 rather than silently
     continuing their conversation, since thread_id alone is otherwise
-    guessable/replayable across accounts.
+    guessable/replayable across accounts. Also records this thread in the
+    sidebar's conversation list (agent/conversations_db.py) — a new entry
+    on the first message of a thread, or just a recency bump on later ones.
     """
     if not request.claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty.")
@@ -195,14 +244,31 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
                 detail="This conversation belongs to a different account.",
             )
         thread_id = request.thread_id
+        # A client-provided thread_id doesn't mean the thread has actually
+        # been used before — app.py generates one upfront for every new
+        # conversation, before the first message is ever sent. owner_id is
+        # only set once a thread has a real checkpoint, so "never had an
+        # owner" is the real signal for "this is new," not "was an id sent."
+        is_new_thread = owner_id is None
     else:
         thread_id = str(uuid.uuid4())
+        is_new_thread = True
 
     try:
         result = run_claim(app.state.graph, request.claim, thread_id, user_id=current_user["id"])
     except Exception:
         logger.exception("Unexpected error running claim for thread %s.", thread_id)
         raise HTTPException(status_code=500, detail="Something went wrong processing this claim.")
+
+    # Record this thread in the sidebar's conversation list on its first
+    # message, or just bump its recency on every later one — kept after a
+    # successful run_claim so a failed claim never creates a phantom
+    # sidebar entry for a conversation that has no actual content yet.
+    if is_new_thread:
+        title = derive_title(request.claim)
+        create_conversation(app.state.pool, thread_id, current_user["id"], title)
+    else:
+        touch_conversation(app.state.pool, thread_id)
 
     messages = result["messages"]
     answer = _extract_text(messages[-1].content) if messages else ""
@@ -211,4 +277,36 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
         answer=answer,
         thread_id=thread_id,
         recursion_limit_hit=result["recursion_limit_hit"],
+    )
+
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+def get_conversations(current_user: dict = Depends(get_current_user)) -> list[ConversationSummary]:
+    """List the authenticated user's conversations, most recently active first."""
+    rows = list_conversations(app.state.pool, current_user["id"])
+    return [ConversationSummary(**row) for row in rows]
+
+
+@app.get("/conversations/{thread_id}/messages", response_model=ConversationHistoryResponse)
+def get_conversation_messages(
+    thread_id: str, current_user: dict = Depends(get_current_user)
+) -> ConversationHistoryResponse:
+    """Return a thread's message history, so the UI can resume it.
+
+    Same ownership check as /chat — a thread belonging to a different
+    user is rejected with 403 rather than leaking its contents. An
+    unknown thread_id (owner_id is None) is also rejected rather than
+    treated as an empty-but-valid conversation, since it was never
+    created through this user's own /chat calls.
+    """
+    owner_id = _get_thread_owner(app.state.graph, thread_id)
+    if owner_id is None or owner_id != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This conversation belongs to a different account.",
+        )
+    state = app.state.graph.get_state({"configurable": {"thread_id": thread_id}})
+    raw_messages = state.values.get("messages", []) if state else []
+    return ConversationHistoryResponse(
+        thread_id=thread_id, messages=_to_conversation_messages(raw_messages)
     )

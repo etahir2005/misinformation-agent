@@ -163,6 +163,48 @@ def _auth_request(endpoint: str, email: str, password: str) -> str | None:
     return response.json()["access_token"]
 
 
+def _fetch_conversations() -> list[dict]:
+    """Fetch the signed-in user's conversation list for the sidebar.
+
+    Fails soft — an unreachable backend just means an empty sidebar list
+    for this render, not a crash, since this runs on every rerun.
+    """
+    try:
+        response = requests.get(
+            f"{API_URL}/conversations",
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException:
+        return []
+
+
+def _load_conversation(thread_id: str) -> None:
+    """Switch the active thread and pull its real message history from the backend.
+
+    Without this, clicking a past conversation would just swap thread_id
+    and show an empty chat window — the backend has the full history, but
+    st.session_state.messages is purely client-side and has no memory of
+    it until fetched explicitly.
+    """
+    try:
+        response = requests.get(
+            f"{API_URL}/conversations/{thread_id}/messages",
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+        st.session_state.thread_id = thread_id
+        st.session_state.messages = [
+            {"role": m["role"], "content": m["content"]} for m in data["messages"]
+        ]
+    except requests.exceptions.RequestException:
+        st.error("Couldn't load that conversation — is the API running?")
+
+
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
 
@@ -233,6 +275,18 @@ with st.sidebar:
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
+
+    conversations = _fetch_conversations()
+    if conversations:
+        st.markdown("### Conversations")
+        for convo in conversations:
+            is_active = convo["thread_id"] == st.session_state.thread_id
+            label = ("→ " if is_active else "") + convo["title"]
+            if st.button(
+                label, key=f"convo_{convo['thread_id']}", use_container_width=True
+            ):
+                _load_conversation(convo["thread_id"])
+                st.rerun()
 
     st.divider()
 
