@@ -69,6 +69,14 @@ LANGFUSE_PUBLIC_KEY: str | None = os.getenv("LANGFUSE_PUBLIC_KEY")
 LANGFUSE_SECRET_KEY: str | None = os.getenv("LANGFUSE_SECRET_KEY")
 LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
+# JWT signing secret for multi-user authentication. Required, not optional
+# (unlike LANGFUSE_*) — auth without a real secret is a security hole, not
+# a degraded-but-functional state, so this follows the same _require_env
+# pattern as the other must-have keys, not Langfuse's opt-in one.
+JWT_SECRET_KEY: str = _require_env("JWT_SECRET_KEY")
+JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "1440"))  # 24h
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
     "vector_lookup_tool to check whether a semantically similar claim has "
