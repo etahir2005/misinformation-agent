@@ -100,3 +100,42 @@ def list_conversations(pool: ConnectionPool, user_id: str) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def delete_conversation(pool: ConnectionPool, thread_id: str) -> None:
+    """Remove a conversation's sidebar row.
+
+    Only removes the row in this table — the caller (main.py) is
+    responsible for also deleting the thread's actual checkpoint data via
+    the checkpointer's own delete_thread(), since this module has no
+    access to the checkpointer and shouldn't reach into LangGraph's own
+    tables directly. A thread_id that doesn't exist here is a silent
+    no-op (DELETE with no matching row simply affects zero rows) rather
+    than an error — the caller already does the ownership/existence check
+    against the checkpoint metadata before calling this, so by the time
+    we get here the "does it exist" question has already been answered.
+    """
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM conversations WHERE thread_id = %s", (thread_id,))
+
+
+def purge_stale_conversations(pool: ConnectionPool, retention_days: int) -> list[str]:
+    """Delete conversations whose sidebar row hasn't been touched in retention_days.
+
+    Returns the thread_ids that were actually deleted, so the caller can
+    also purge their checkpoint data — this table's updated_at is the
+    source of truth for "how long has this conversation been idle," but
+    the checkpoint data itself lives elsewhere and has to be cleaned up
+    separately by whoever holds the checkpointer (see main.py's lifespan).
+    Uses make_interval() rather than string-formatting the interval, so
+    retention_days stays a normal bound parameter instead of being
+    interpolated into the SQL text.
+    """
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "DELETE FROM conversations "
+            "WHERE updated_at < now() - make_interval(days => %s) "
+            "RETURNING thread_id",
+            (retention_days,),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
