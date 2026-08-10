@@ -11,7 +11,7 @@ Early build in progress. Currently implemented:
 - `web_search_tool` (Tavily) — general web search for evidence when no existing ruling is found
 - `source_retrieval_tool` (Tavily Extract) — fetches full article text from a specific URL
 - `credibility_scoring_tool` — judges source reliability and produces a confidence score when there's no clean existing ruling to rely on
-- `vector_lookup_tool` — semantic claim cache (Pinecone + local embeddings) that reuses a prior verdict when a claim is a close rewording of one already checked, instead of re-running the full pipeline
+- `vector_lookup_tool` — semantic claim cache (Pinecone + local embeddings) that reuses a prior verdict when a claim is a close rewording of one already checked, instead of re-running the full pipeline. Two-stage retrieval: Pinecone's cosine similarity does a cheap first pass over `VECTOR_SEARCH_TOP_K` candidates, then a CrossEncoder reranker (`BAAI/bge-reranker-base` by default) re-scores that smaller set more accurately — mitigates the "curse of dimensionality," where the single nearest neighbor by raw cosine similarity isn't always the true best match in a high-dimensional embedding space. A match is only reused if the reranked score clears `RERANK_MIN_SCORE` and — when more than one candidate exists — beats the runner-up by at least `RERANK_MIN_MARGIN`, replacing the old flat `CLAIM_SIMILARITY_THRESHOLD` cutoff. The Pinecone query also filters out anything older than `CLAIM_CACHE_MAX_AGE_DAYS` via a `checked_at_ts` metadata filter, so a stale verdict on a fast-moving topic can't be reused indefinitely
 - Deterministic routing: cache check first, then fact-check database, web search as fallback, credibility scoring forced whenever the evidence gathered doesn't already amount to a single clean True/False ruling
 - First-turn tool use forced (`tool_choice="any"`) so the agent always checks the cache and gathers evidence before answering
 - A 16-step recursion limit on the tool-calling loop, with a graceful partial-progress fallback instead of a crash
@@ -74,6 +74,11 @@ TAVILY_API_KEY=
 GOOGLE_FACT_CHECK_API_KEY=
 PINECONE_API_KEY=
 PINECONE_INDEX_NAME=
+VECTOR_SEARCH_TOP_K=5
+RERANKER_MODEL_NAME=BAAI/bge-reranker-base
+RERANK_MIN_SCORE=0.0
+RERANK_MIN_MARGIN=0.15
+CLAIM_CACHE_MAX_AGE_DAYS=180
 MODEL_NAME=gemini-3.1-flash-lite
 POSTGRES_CONNECTION_STRING=
 JWT_SECRET_KEY=
@@ -119,7 +124,7 @@ python -m ruff check .
 - Tavily — web search and article extraction
 - Google Fact Check Tools API — existing fact-check lookups
 - Pinecone — vector database for the semantic claim cache
-- sentence-transformers (BAAI/bge-base-en-v1.5) — local embedding model for the claim cache
+- sentence-transformers — local embedding model (BAAI/bge-base-en-v1.5) and CrossEncoder reranker (BAAI/bge-reranker-base) for the claim cache's two-stage retrieval
 - Postgres (Neon) via `langgraph-checkpoint-postgres` / `psycopg` — conversation state persistence
 - argon2-cffi — password hashing (argon2id) for multi-user authentication
 - PyJWT — signed session tokens for multi-user authentication
