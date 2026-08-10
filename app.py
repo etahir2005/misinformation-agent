@@ -163,6 +163,22 @@ def _auth_request(endpoint: str, email: str, password: str) -> str | None:
     return response.json()["access_token"]
 
 
+def _apply_refreshed_token(response: requests.Response) -> None:
+    """Pick up a sliding-session refresh token if the backend issued one.
+
+    main.py's get_current_user() reissues a fresh, short-lived token on
+    every successful authenticated call (see JWT_EXPIRY_MINUTES) instead of
+    handing out one long-lived one — this is the client-side half of that:
+    whenever a response carries a new token, swap it into session state so
+    the *next* request uses the fresh one instead of the older, closer-to-
+    expiring one. Without this, sessions would hard-expire after
+    JWT_EXPIRY_MINUTES regardless of how active the user actually was.
+    """
+    new_token = response.headers.get("X-New-Token")
+    if new_token:
+        st.session_state.access_token = new_token
+
+
 def _fetch_conversations() -> list[dict]:
     """Fetch the signed-in user's conversation list for the sidebar.
 
@@ -176,6 +192,7 @@ def _fetch_conversations() -> list[dict]:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
+        _apply_refreshed_token(response)
         return response.json()
     except requests.exceptions.RequestException:
         return []
@@ -196,6 +213,7 @@ def _load_conversation(thread_id: str) -> None:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
+        _apply_refreshed_token(response)
         data = response.json()
         st.session_state.thread_id = thread_id
         st.session_state.messages = [
@@ -357,6 +375,7 @@ if claim:
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
                 response.raise_for_status()
+                _apply_refreshed_token(response)
                 data = response.json()
                 answer = data["answer"]
                 if data.get("recursion_limit_hit"):

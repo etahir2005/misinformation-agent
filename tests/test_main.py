@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 import main
-from agent.auth import create_access_token
+from agent.auth import create_access_token, decode_access_token
 from agent.guardrail import MessageIntent
 from agent.users_db import EmailAlreadyRegisteredError
 
@@ -144,6 +144,7 @@ def test_login_rejects_unknown_email(client: TestClient) -> None:
 def test_chat_requires_a_token(client: TestClient) -> None:
     response = client.post("/chat", json={"claim": "Is the sky blue?"})
     assert response.status_code == 401
+    assert "X-New-Token" not in response.headers
 
 
 def test_chat_rejects_garbage_token(client: TestClient) -> None:
@@ -153,6 +154,7 @@ def test_chat_rejects_garbage_token(client: TestClient) -> None:
         headers={"Authorization": "Bearer not-a-real-token"},
     )
     assert response.status_code == 401
+    assert "X-New-Token" not in response.headers
 
 
 def test_chat_returns_answer_and_generates_thread_id(client: TestClient) -> None:
@@ -162,6 +164,25 @@ def test_chat_returns_answer_and_generates_thread_id(client: TestClient) -> None
     assert body["answer"] == "Final answer."
     assert body["thread_id"]
     assert body["recursion_limit_hit"] is False
+
+
+def test_chat_response_includes_a_refreshed_token(client: TestClient) -> None:
+    """Every authenticated call issues a fresh token via X-New-Token — the
+    sliding-session mechanism, not just one fixed-expiry token handed out
+    at login. See get_current_user() in main.py.
+    """
+    response = client.post(
+        "/chat",
+        json={"claim": "Is the sky blue?"},
+        headers=_auth_header(user_id="user-1", email="person@example.com"),
+    )
+    assert response.status_code == 200
+    new_token = response.headers.get("X-New-Token")
+    assert new_token
+    payload = decode_access_token(new_token)
+    assert payload is not None
+    assert payload["sub"] == "user-1"
+    assert payload["email"] == "person@example.com"
 
 
 def test_chat_reuses_provided_thread_id_for_the_same_user(client: TestClient) -> None:

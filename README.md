@@ -19,7 +19,7 @@ Early build in progress. Currently implemented:
 - `graph.py` — shared graph-building and invocation logic, used by both the FastAPI app and the CLI script
 - `agent/tracing.py` — optional Langfuse tracing for the orchestrator graph. Lazily builds a callback handler on first use (same pattern as `agent/guardrail.py`'s intent model and `vector_lookup_tool.py`'s embedding model), and returns `None` if `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` aren't set — tracing is opt-in observability, never a hard dependency. Wired into every `run_claim()` call in `graph.py`; each trace is tagged with `langfuse_session_id` set to the thread_id, so a whole conversation's turns group into one session in the Langfuse dashboard instead of showing up as disconnected calls
 - `main.py` — FastAPI app wrapping the graph, with `/chat`, `/auth/signup`, `/auth/login`, and a `/health` check. Checkpointer is opened once at startup via `lifespan`, not per request. `/chat` requires a `Bearer` JWT (via `Authorization` header) identifying the requesting user — `/auth/signup` and `/auth/login` are necessarily open, and `/health` stays open for uptime monitors
-- `agent/auth.py` — password hashing (argon2id) and JWT session-token creation/validation for multi-user authentication
+- `agent/auth.py` — password hashing (argon2id) and JWT session-token creation/validation for multi-user authentication. Tokens are short-lived (`JWT_EXPIRY_MINUTES`, default 30) and slide forward on activity — every authenticated request in `main.py` reissues a fresh token via the `X-New-Token` response header, which `app.py` picks up and stores, so an active session keeps renewing while a genuinely idle one still hard-expires
 - `agent/users_db.py` — Postgres-backed user storage (a `users` table, separate from LangGraph's own checkpoint tables), used by the `/auth/*` endpoints
 - Per-user thread ownership scoping — each `/chat` call records the requesting user's id in the thread's own checkpoint metadata; continuing an existing `thread_id` that belongs to a different user is rejected (403) instead of silently resuming their conversation
 - `agent/conversations_db.py` — a thin `conversations` table (title + recency only, not a second copy of message content) backing a sidebar conversation list. `/chat` records a new row on a thread's first message and bumps `updated_at` on later ones; `GET /conversations` lists a user's threads most-recently-active first, `GET /conversations/{thread_id}/messages` returns a thread's real history (read back from the checkpointer, filtered down to user turns and final answers) so resuming a conversation shows its actual content rather than an empty chat. Basic scope only — list and resume to latest, no branching/forking of a conversation from an earlier point
@@ -77,6 +77,7 @@ PINECONE_INDEX_NAME=
 MODEL_NAME=gemini-3.1-flash-lite
 POSTGRES_CONNECTION_STRING=
 JWT_SECRET_KEY=
+JWT_EXPIRY_MINUTES=30
 LANGFUSE_PUBLIC_KEY=
 LANGFUSE_SECRET_KEY=
 ```

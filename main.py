@@ -4,7 +4,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 
@@ -54,6 +54,7 @@ def _extract_text(content: str | list) -> str:
 
 
 def get_current_user(
+    response: Response,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> dict:
     """Resolve the authenticated user from a Bearer JWT, or reject the request.
@@ -62,6 +63,17 @@ def get_current_user(
     here instead of FastAPI's generic 403 — every failure mode (missing
     header, malformed token, expired token, bad signature) ends up as the
     same 401 with a clear message, not several different error shapes.
+
+    Also implements the sliding session: JWT_EXPIRY_MINUTES is short (30
+    minutes), so every successful authenticated call reissues a brand-new
+    token with a fresh expiry and attaches it via the X-New-Token response
+    header. A JWT's own expiry can't be extended in place once signed — the
+    only way to slide a session forward is to hand back a new token — so an
+    active user's session keeps renewing itself on every request, while a
+    genuinely idle session still hard-expires after JWT_EXPIRY_MINUTES with
+    no activity. app.py is responsible for picking this header up and
+    replacing its stored token; every endpoint that depends on this
+    function gets the refresh for free, nothing extra needed per-endpoint.
     """
     if credentials is None:
         raise HTTPException(
@@ -72,6 +84,7 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token."
         )
+    response.headers["X-New-Token"] = create_access_token(payload["sub"], payload["email"])
     return {"id": payload["sub"], "email": payload["email"]}
 
 

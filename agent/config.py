@@ -75,7 +75,11 @@ LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 # pattern as the other must-have keys, not Langfuse's opt-in one.
 JWT_SECRET_KEY: str = _require_env("JWT_SECRET_KEY")
 JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
-JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "1440"))  # 24h
+# Short-lived on purpose, combined with a sliding refresh (see main.py's
+# get_current_user) rather than one long-lived token — every authenticated
+# request reissues a fresh JWT_EXPIRY_MINUTES-minute token, so an active
+# session keeps sliding forward and only a genuinely idle session expires.
+JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "30"))
 
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
