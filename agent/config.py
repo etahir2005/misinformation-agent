@@ -65,7 +65,7 @@ RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-base")
 # not 0-1) relevance score — expect to tune them from the actual scores
 # observed during manual verification against real claims, not treat them
 # as fixed a priori constants the way the old cosine threshold was.
-RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.0"))
+RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.5"))
 RERANK_MIN_MARGIN = float(os.getenv("RERANK_MIN_MARGIN", "0.15"))
 
 # Cached claims older than this are excluded from lookup entirely, via a
