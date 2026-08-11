@@ -347,6 +347,29 @@ def test_chat_creates_conversation_for_new_thread(client: TestClient) -> None:
     assert title == "Is the sky blue?"
 
 
+def test_chat_creates_conversation_title_from_scrubbed_claim_not_raw_request(
+    client: TestClient,
+) -> None:
+    """Regression test: the sidebar conversation title must be derived from
+    the *scrubbed* claim (result["claim"], from graph.run_claim()), not the
+    raw request.claim — otherwise PII redacted everywhere else in the
+    pipeline still ends up stored in the conversations table's title
+    column. Caught via a live Streamlit smoke test, not the (fully mocked)
+    test suite that existed before this test.
+    """
+    with patch("main.create_conversation") as mock_create:
+        response = client.post(
+            "/chat",
+            json={"claim": "Email me at jane@example.com about this claim."},
+            headers=_auth_header(user_id="user-1"),
+        )
+    assert response.status_code == 200
+    mock_create.assert_called_once()
+    _, _, _, title = mock_create.call_args.args
+    assert "jane@example.com" not in title
+    assert "[REDACTED_EMAIL]" in title
+
+
 def test_chat_touches_conversation_for_existing_thread(client: TestClient) -> None:
     """A second message on an already-existing thread should bump recency, not re-create it."""
     headers = _auth_header(user_id="user-1")

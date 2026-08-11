@@ -63,6 +63,32 @@ def test_run_claim_never_checkpoints_raw_pii(
                 assert "jane@example.com" not in message.content
 
 
+@patch("agent.guardrail._get_intent_model")
+@patch("agent.orchestrator.init_chat_model")
+def test_run_claim_returns_the_scrubbed_claim_not_the_raw_input(
+    mock_init_chat_model: MagicMock, mock_get_intent_model: MagicMock
+) -> None:
+    """Regression test: callers (main.py's derive_title() in particular)
+    must be able to get the *scrubbed* claim text back from run_claim(),
+    not just have it redacted internally — otherwise a caller that derives
+    something display- or storage-bound from the original claim string
+    (e.g. a conversation title) ends up with raw PII in it even though the
+    claim itself was correctly redacted everywhere else. Caught via a live
+    Streamlit smoke test, not the mocked test suite.
+    """
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_model
+    mock_model.invoke.return_value = AIMessage(content="Answer.")
+    mock_init_chat_model.return_value = mock_model
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
+
+    graph = build_graph(InMemorySaver())
+    result = run_claim(graph, "Email me at jane@example.com about this claim.", "test-thread")
+
+    assert "jane@example.com" not in result["claim"]
+    assert "[REDACTED_EMAIL]" in result["claim"]
+
+
 @patch("graph.build_orchestrator")
 def test_run_claim_handles_recursion_limit_gracefully(mock_build_orchestrator: MagicMock) -> None:
     """A GraphRecursionError should return partial progress, not raise into the caller."""

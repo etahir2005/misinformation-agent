@@ -335,7 +335,12 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
     # (or doesn't bump recency) in the sidebar list — not a lost answer.
     try:
         if is_new_thread:
-            title = derive_title(request.claim)
+            # result["claim"] is the *scrubbed* claim text, not
+            # request.claim — using the raw request here would write
+            # unredacted PII (e.g. an email in the claim) straight into
+            # the conversations table's title column, even though the
+            # claim itself is correctly redacted everywhere else.
+            title = derive_title(result["claim"])
             create_conversation(app.state.pool, thread_id, current_user["id"], title)
         else:
             touch_conversation(app.state.pool, thread_id)

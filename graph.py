@@ -50,14 +50,23 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
         "recursion_limit_hit" (bool) — True if the graph had to be cut off
         before reaching a final answer, in which case "messages" holds
         whatever partial progress was made rather than a complete answer —
-        and "pending_review" (dict | None) — set when the graph paused at
+        "pending_review" (dict | None) — set when the graph paused at
         human_review_node (agent/orchestrator.py) because
         verdict_is_complete was False for this turn. "messages" is still
         populated in that case (the not-yet-reviewed answer), so callers
         that don't check pending_review keep working exactly as before;
         this key is additive, not a breaking change to the return shape.
         Nothing resumes the graph yet — that's Phase 4/5's job, once a
-        human actually has a way to submit a decision.
+        human actually has a way to submit a decision — and "claim" (str),
+        the *scrubbed* version of the input claim. Callers that derive
+        anything display- or storage-bound from the claim text (e.g.
+        main.py's derive_title() for the sidebar conversation list) must
+        use this, not their own original input — scrub_pii() only redacts
+        the copy passed into graph.invoke(); it was never handed back to
+        the caller before, which is exactly how a raw email ended up
+        stored in a conversation's title despite this same claim's content
+        being correctly redacted everywhere else. Caught via a live
+        Streamlit smoke test, not by the (fully mocked) test suite.
     """
     claim = scrub_pii(claim)
     config = {
@@ -77,6 +86,7 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
             "messages": result.get("messages", []),
             "recursion_limit_hit": False,
             "pending_review": pending_review,
+            "claim": claim,
         }
     except GraphRecursionError:
         logger.warning(
@@ -89,4 +99,5 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
             "messages": partial_state.values.get("messages", []),
             "recursion_limit_hit": True,
             "pending_review": None,
+            "claim": claim,
         }
