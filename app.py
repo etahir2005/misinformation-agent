@@ -223,6 +223,27 @@ def _load_conversation(thread_id: str) -> None:
         st.error("Couldn't load that conversation — is the API running?")
 
 
+def _delete_conversation(thread_id: str) -> bool:
+    """Delete a conversation via the backend. Returns True on success.
+
+    Renders its own st.error on failure, same convention as the other
+    HTTP helpers above (_auth_request, _fetch_conversations,
+    _load_conversation) — callers just check the return value instead of
+    handling the request/response themselves.
+    """
+    try:
+        response = requests.delete(
+            f"{API_URL}/conversations/{thread_id}",
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        st.error("Couldn't delete that conversation — is the API running?")
+        return False
+
+
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
 
@@ -300,11 +321,27 @@ with st.sidebar:
         for convo in conversations:
             is_active = convo["thread_id"] == st.session_state.thread_id
             label = ("→ " if is_active else "") + convo["title"]
-            if st.button(
-                label, key=f"convo_{convo['thread_id']}", use_container_width=True
-            ):
-                _load_conversation(convo["thread_id"])
-                st.rerun()
+            row_col, delete_col = st.columns([5, 1])
+            with row_col:
+                if st.button(
+                    label, key=f"convo_{convo['thread_id']}", use_container_width=True
+                ):
+                    _load_conversation(convo["thread_id"])
+                    st.rerun()
+            with delete_col:
+                if st.button(
+                    "🗑️", key=f"delete_{convo['thread_id']}", use_container_width=True
+                ):
+                    if _delete_conversation(convo["thread_id"]):
+                        # If the conversation being deleted is the one
+                        # currently open, reset to a fresh session — same
+                        # as clicking "New conversation" — so the chat
+                        # window doesn't keep showing messages for a
+                        # thread that no longer exists on the backend.
+                        if is_active:
+                            st.session_state.thread_id = str(uuid.uuid4())
+                            st.session_state.messages = []
+                        st.rerun()
 
     st.divider()
 

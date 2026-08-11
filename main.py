@@ -15,10 +15,13 @@ from agent.auth import (
     verify_password,
 )
 from agent.checkpointer import build_checkpointer, build_connection_pool
+from agent.config import CONVERSATION_RETENTION_DAYS
 from agent.conversations_db import (
     create_conversation,
+    delete_conversation,
     derive_title,
     list_conversations,
+    purge_stale_conversations,
     setup_conversations_table,
     touch_conversation,
 )
@@ -51,6 +54,24 @@ def _extract_text(content: str | list) -> str:
         for block in content
         if isinstance(block, dict) and block.get("type") == "text"
     )
+
+
+def _is_valid_uuid(value: str) -> bool:
+    """Check whether a string is a well-formed UUID.
+
+    Used to reject a malformed client-provided thread_id up front, before
+    any real work happens — the conversations table's thread_id column is
+    typed UUID (see agent/conversations_db.py), so a non-UUID thread_id
+    would otherwise process a claim in full (a real Gemini/Tavily/Pinecone
+    pass) only to end up as an orphaned checkpoint thread that can never
+    be recorded in, listed from, or deleted through the sidebar — better
+    to reject it immediately with a clear 400 than let that happen.
+    """
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
 
 
 def get_current_user(
@@ -123,6 +144,24 @@ async def lifespan(app: FastAPI):
         setup_conversations_table(pool)
         checkpointer = build_checkpointer(pool)
         app.state.graph = build_graph(checkpointer)
+
+        # Purge conversations that have been idle longer than the configured
+        # retention window. Runs once per startup rather than on a timer —
+        # simple and sufficient for this app's scale, and avoids needing a
+        # background scheduler/task queue just for housekeeping. The sidebar
+        # row and the underlying checkpoint data are two separate stores
+        # (see agent/conversations_db.py), so both have to be cleaned up
+        # here — purge_stale_conversations() only knows about the former.
+        purged_thread_ids = purge_stale_conversations(pool, CONVERSATION_RETENTION_DAYS)
+        for stale_thread_id in purged_thread_ids:
+            checkpointer.delete_thread(stale_thread_id)
+        if purged_thread_ids:
+            logger.info(
+                "Purged %d conversation(s) older than %d days.",
+                len(purged_thread_ids),
+                CONVERSATION_RETENTION_DAYS,
+            )
+
         logger.info("FastAPI startup complete — graph ready.")
         yield
     logger.info("FastAPI shutting down — connection pool closed.")
@@ -249,6 +288,9 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
     if not request.claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty.")
 
+    if request.thread_id and not _is_valid_uuid(request.thread_id):
+        raise HTTPException(status_code=400, detail="thread_id must be a valid UUID.")
+
     if request.thread_id:
         owner_id = _get_thread_owner(app.state.graph, request.thread_id)
         if owner_id is not None and owner_id != current_user["id"]:
@@ -277,11 +319,28 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
     # message, or just bump its recency on every later one — kept after a
     # successful run_claim so a failed claim never creates a phantom
     # sidebar entry for a conversation that has no actual content yet.
-    if is_new_thread:
-        title = derive_title(request.claim)
-        create_conversation(app.state.pool, thread_id, current_user["id"], title)
-    else:
-        touch_conversation(app.state.pool, thread_id)
+    #
+    # Deliberately caught and logged rather than left to propagate: by
+    # this point the claim has already been fully processed and answered
+    # (a real Gemini/Tavily/Pinecone pass), and that real conversation
+    # data is already safe in the checkpoint regardless of what happens
+    # here. thread_id is already guaranteed to be a well-formed UUID by
+    # now (see the _is_valid_uuid check above), but the write itself can
+    # still fail for other reasons — a dropped connection, Neon
+    # auto-suspending mid-request, any transient Postgres hiccup. Failing
+    # this bookkeeping step is a much smaller problem than discarding a
+    # real answer and returning a 500 for it, which would also make a
+    # client naively retrying re-run the entire expensive pipeline for
+    # nothing. Worst case here is just a conversation that doesn't show up
+    # (or doesn't bump recency) in the sidebar list — not a lost answer.
+    try:
+        if is_new_thread:
+            title = derive_title(request.claim)
+            create_conversation(app.state.pool, thread_id, current_user["id"], title)
+        else:
+            touch_conversation(app.state.pool, thread_id)
+    except Exception:
+        logger.exception("Failed to record conversation %s in the sidebar list.", thread_id)
 
     messages = result["messages"]
     answer = _extract_text(messages[-1].content) if messages else ""
@@ -323,3 +382,37 @@ def get_conversation_messages(
     return ConversationHistoryResponse(
         thread_id=thread_id, messages=_to_conversation_messages(raw_messages)
     )
+
+
+@app.delete("/conversations/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversation_endpoint(
+    thread_id: str, current_user: dict = Depends(get_current_user)
+) -> None:
+    """Delete a conversation entirely — both its sidebar entry and its checkpoint data.
+
+    Same ownership check as the other /conversations endpoints: an unknown
+    thread_id or one belonging to a different user is rejected with 403
+    rather than treated as "already deleted," for the same reasons as
+    get_conversation_messages above. Deletes checkpoint data first and the
+    sidebar row second — if the checkpoint delete fails, the sidebar entry
+    is left in place so the conversation isn't silently hidden while its
+    underlying data still exists; if the sidebar delete were to fail after
+    a successful checkpoint delete, the next GET /conversations simply
+    won't show a stale entry for long since a following retry or the
+    retention purge would still clean it up, whereas the reverse ordering
+    could leak a resumable-looking conversation whose data is actually gone.
+    """
+    owner_id = _get_thread_owner(app.state.graph, thread_id)
+    if owner_id is None or owner_id != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This conversation belongs to a different account.",
+        )
+    try:
+        app.state.graph.checkpointer.delete_thread(thread_id)
+        delete_conversation(app.state.pool, thread_id)
+    except Exception:
+        logger.exception("Unexpected error deleting thread %s.", thread_id)
+        raise HTTPException(
+            status_code=500, detail="Something went wrong deleting this conversation."
+        )

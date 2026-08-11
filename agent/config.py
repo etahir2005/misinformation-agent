@@ -81,6 +81,14 @@ JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
 # session keeps sliding forward and only a genuinely idle session expires.
 JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "30"))
 
+# How long a conversation is kept before it's automatically purged (both
+# its sidebar entry and its underlying LangGraph checkpoint data — see
+# agent/conversations_db.py's purge_stale_conversations() and main.py's
+# lifespan). Configurable rather than fixed, since how long conversations
+# should be retained is a product/policy decision, not a technical one —
+# different deployments may want a much shorter or longer window.
+CONVERSATION_RETENTION_DAYS: int = int(os.getenv("CONVERSATION_RETENTION_DAYS", "10"))
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
     "vector_lookup_tool to check whether a semantically similar claim has "
