@@ -46,10 +46,18 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
             record.
 
     Returns:
-        A dict with "messages" (the full resulting message list) and
+        A dict with "messages" (the full resulting message list),
         "recursion_limit_hit" (bool) — True if the graph had to be cut off
         before reaching a final answer, in which case "messages" holds
-        whatever partial progress was made rather than a complete answer.
+        whatever partial progress was made rather than a complete answer —
+        and "pending_review" (dict | None) — set when the graph paused at
+        human_review_node (agent/orchestrator.py) because
+        verdict_is_complete was False for this turn. "messages" is still
+        populated in that case (the not-yet-reviewed answer), so callers
+        that don't check pending_review keep working exactly as before;
+        this key is additive, not a breaking change to the return shape.
+        Nothing resumes the graph yet — that's Phase 4/5's job, once a
+        human actually has a way to submit a decision.
     """
     claim = scrub_pii(claim)
     config = {
@@ -63,7 +71,13 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
         config["metadata"]["langfuse_session_id"] = thread_id
     try:
         result = graph.invoke({"messages": [{"role": "user", "content": claim}]}, config=config)
-        return {"messages": result["messages"], "recursion_limit_hit": False}
+        interrupts = result.get("__interrupt__")
+        pending_review = interrupts[0].value if interrupts else None
+        return {
+            "messages": result.get("messages", []),
+            "recursion_limit_hit": False,
+            "pending_review": pending_review,
+        }
     except GraphRecursionError:
         logger.warning(
             "Recursion limit (%d) hit for thread %s — returning partial progress.",
@@ -74,4 +88,5 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
         return {
             "messages": partial_state.values.get("messages", []),
             "recursion_limit_hit": True,
+            "pending_review": None,
         }

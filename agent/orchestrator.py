@@ -8,7 +8,8 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
 from agent.config import MODEL_NAME, SYSTEM_PROMPT
 from agent.guardrail import classify_message_intent
@@ -237,6 +238,64 @@ def summarize_node(state: MessagesState) -> dict:
     return {"messages": removals + [summary_message]}
 
 
+def human_review_node(state: OrchestratorState) -> dict:
+    """Pause the graph for human review when a verdict was judged incomplete.
+
+    Only reached via route_after_orchestrator when verdict_is_complete is
+    False. interrupt() pauses execution here and surfaces the payload below
+    to whatever's driving the graph — nothing consumes it yet. Phase 4
+    (Slack escalation tool) and Phase 5 (Streamlit approval UI) are what
+    will actually notify a human and let them respond with
+    Command(resume=...); this node only proves the pause/resume mechanics
+    work, it doesn't yet decide what a human's response should change.
+
+    IMPORTANT for whoever builds Phase 4's Slack notification: LangGraph
+    re-executes a node's logic from the top on every resume, not just the
+    interrupt() call itself. A one-time side effect like sending a Slack
+    message placed *before* this interrupt() call would fire again on
+    every resume unless it's made idempotent or split into its own node
+    that runs once, ahead of this one. Do not add the Slack call directly
+    into this node as currently written.
+
+    The resume value's shape isn't finalized — Phase 5 decides what a human
+    actually submits. Resuming with any value (or none) simply lets the
+    graph finish with the existing answer for now; nothing reads the
+    resume value yet.
+    """
+    latest_human_message = _current_turn_messages(state)[0]
+    final_answer = state["messages"][-1]
+    interrupt(
+        {
+            "reason": "verdict_incomplete",
+            "claim": latest_human_message.content,
+            "verdict": final_answer.content,
+        }
+    )
+    return {}
+
+
+def route_after_orchestrator(state: OrchestratorState) -> str:
+    """Route after the orchestrator's response: continue the tool loop if
+    there are more tool calls to make; otherwise decide whether this
+    turn's final answer needs human review before the graph finishes.
+
+    Replaces langgraph.prebuilt.tools_condition (rather than composing
+    with it) since tools_condition has no hook for a second check after
+    "no tool calls" — this reimplements its tool-call check directly, plus
+    the new verdict_is_complete branch. A final answer whose
+    verdict_is_complete is False (set by _check_and_store_verdict inside
+    call_model) routes to human_review instead of ending the graph
+    outright; True or None (cache hits, greetings, and anything that
+    doesn't set it) end normally, same as before this feature existed.
+    """
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
+    if state.get("verdict_is_complete") is False:
+        return "human_review"
+    return END
+
+
 def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
     """Build and compile the single-agent orchestrator graph.
 
@@ -316,13 +375,15 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
     builder.add_node("summarize", summarize_node)
     builder.add_node("orchestrator", call_model)
     builder.add_node("tools", ToolNode(TOOLS))
+    builder.add_node("human_review", human_review_node)
 
     builder.add_edge(START, "pii_scrub")
     builder.add_edge("pii_scrub", "guardrail")
     builder.add_conditional_edges("guardrail", route_after_guardrail)
     builder.add_edge("summarize", "orchestrator")
-    builder.add_conditional_edges("orchestrator", tools_condition)
+    builder.add_conditional_edges("orchestrator", route_after_orchestrator)
     builder.add_edge("tools", "orchestrator")
+    builder.add_edge("human_review", END)
 
     graph = builder.compile(checkpointer=checkpointer)
     logger.info("Orchestrator graph compiled with %d tool(s) + guardrail.", len(TOOLS))
