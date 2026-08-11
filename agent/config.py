@@ -152,6 +152,43 @@ CREDIBILITY_SCORING_PROMPT: str = (
     "whether the source happens to agree with what you'd expect."
 )
 
+# Verdict-completeness check (agent/verdict_completeness.py) — the last
+# line of defense before a claim's final answer is cached for reuse. A
+# separate model from MODEL_NAME on purpose: a second, independent pass is
+# more useful for catching what the main answer-generating pass missed
+# than reusing the exact same model/config that produced the verdict being
+# checked. Deliberately gemini-3.5-flash-lite, not a larger "bigger model"
+# tier — this project's free-tier rate limits cap the non-lite Flash tiers
+# at 20 requests/day, nowhere near enough for JUDGE_CONSENSUS_CALLS calls
+# per verdict plus offline calibration; flash-lite tiers allow 500/day.
+JUDGE_MODEL_NAME = os.getenv("JUDGE_MODEL_NAME", "gemini-3.5-flash-lite")
+
+# A verdict below this word count is treated as incomplete without even
+# calling the judge — a hard, zero-hallucination-risk floor, not a
+# sufficiency check on its own. A long verdict can still be vague; only
+# the judge (not a word count) can catch that half of the failure mode.
+VERDICT_MIN_WORD_COUNT = int(os.getenv("VERDICT_MIN_WORD_COUNT", "15"))
+
+# The judge is called this many times per verdict and needs a strict
+# majority of *successful* calls to agree "complete" before the verdict is
+# trusted — a single call deciding completeness would inherit an LLM
+# judge's own hallucination risk with no redundancy check at all.
+JUDGE_CONSENSUS_CALLS = int(os.getenv("JUDGE_CONSENSUS_CALLS", "3"))
+
+VERDICT_COMPLETENESS_JUDGE_PROMPT: str = (
+    "You are checking whether a fact-checking verdict actually addresses "
+    "the claim it was given — not judging whether the verdict's "
+    "conclusion is correct. Given a claim, the verdict text produced for "
+    "it, and the sources used, decide: does the verdict give a real, "
+    "reasoned answer grounded in the sources, or is it vague, evasive, a "
+    "non-answer, or a conclusion the sources don't actually support?\n\n"
+    "A short but honest \"the evidence is thin or conflicting, so no "
+    "confident verdict is possible\" counts as complete — that is a real, "
+    "reasoned answer. A verdict that dodges the claim, restates it "
+    "without resolving it, or draws a conclusion unsupported by the "
+    "sources does not."
+)
+
 GUARDRAIL_PROMPT: str = (
     "Classify the user's message into exactly one category.\n\n"
     "\"claim\" — the message contains a specific, checkable factual "

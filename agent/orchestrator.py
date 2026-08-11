@@ -14,8 +14,8 @@ from agent.config import MODEL_NAME, SYSTEM_PROMPT
 from agent.guardrail import classify_message_intent
 from agent.orchestrator_responses import (
     _build_cache_hit_response,
+    _check_and_store_verdict,
     _gather_sources_for_scoring,
-    _store_verdict_if_new,
 )
 from agent.orchestrator_routing import (
     _SUMMARY_MESSAGE_ID,
@@ -132,6 +132,13 @@ class OrchestratorState(MessagesState):
     """
 
     intent_category: Literal["greeting", "claim", "out_of_scope"] | None
+    # Set once per turn, only when this turn produced a final answer (no
+    # tool_calls) — see _check_and_store_verdict. None on every other turn
+    # (cache hits, greetings/out-of-scope, or mid-tool-loop steps), not
+    # False — a future escalation-routing node needs to tell "this verdict
+    # was judged incomplete" apart from "no verdict was produced to judge
+    # this turn at all."
+    verdict_is_complete: bool | None
 
 
 def pii_scrub_node(state: OrchestratorState) -> dict:
@@ -297,10 +304,11 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
             if tool_call["name"] == "credibility_scoring_tool":
                 tool_call["args"]["sources"] = _gather_sources_for_scoring(turn_state)
 
+        verdict_is_complete = None
         if not response.tool_calls:
-            _store_verdict_if_new(turn_state)
+            verdict_is_complete = _check_and_store_verdict(turn_state, response)
 
-        return {"messages": [response]}
+        return {"messages": [response], "verdict_is_complete": verdict_is_complete}
 
     builder = StateGraph(OrchestratorState)
     builder.add_node("pii_scrub", pii_scrub_node)

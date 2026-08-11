@@ -17,6 +17,7 @@ from agent.orchestrator_routing import (
     _needs_credibility_scoring,
 )
 from agent.tools.vector_lookup_tool import store_verdict
+from agent.verdict_completeness import check_verdict_completeness
 
 
 def _gather_sources_for_scoring(state: MessagesState) -> list[dict[str, Any]]:
@@ -68,6 +69,54 @@ def _build_cache_hit_response(cache_result: dict[str, Any]) -> AIMessage:
         f"previously.\n\n{summary}\n\n**Sources:**\n{sources_text}"
     )
     return AIMessage(content=text)
+
+
+def _extract_verdict_text(content: str | list) -> str:
+    """Normalize a final AIMessage's content into plain text for the
+    verdict-completeness check.
+
+    Duplicated from main.py's _extract_text rather than imported — main.py
+    is the outermost layer (the FastAPI app), so importing from it here
+    would invert that layering. Small enough that duplicating a handful of
+    lines is less risk than restructuring an already-tested shared helper.
+    """
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _check_and_store_verdict(state: MessagesState, response: AIMessage) -> bool:
+    """Check this turn's final answer for completeness, and only cache it
+    for future reuse if it passes.
+
+    An incomplete verdict shouldn't be cached and silently reused for
+    every future semantically-similar claim — that would multiply the
+    harm of one weak answer instead of containing it to a single turn.
+    Runs regardless of whether this turn resolved via
+    fact_check_lookup_tool or credibility_scoring_tool.
+
+    Returns True if there was nothing to check (no claim on record, e.g.
+    an edge case where vector_lookup_tool was never actually called) or if
+    the verdict was judged complete; False otherwise. Callers that care
+    about escalating incomplete verdicts should check this return value.
+    """
+    vector_lookup_args = _last_tool_call_args(state, "vector_lookup_tool")
+    claim = vector_lookup_args.get("claim", "") if vector_lookup_args else ""
+    if not claim:
+        return True
+
+    sources = _gather_sources_for_scoring(state)
+    verdict_text = _extract_verdict_text(response.content)
+    is_complete = check_verdict_completeness(claim, verdict_text, sources)
+
+    if is_complete:
+        _store_verdict_if_new(state)
+
+    return is_complete
 
 
 def _store_verdict_if_new(state: MessagesState) -> None:

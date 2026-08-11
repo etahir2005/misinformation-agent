@@ -7,6 +7,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agent.orchestrator_responses import (
     _build_cache_hit_response,
+    _check_and_store_verdict,
+    _extract_verdict_text,
     _gather_sources_for_scoring,
     _store_verdict_if_new,
 )
@@ -176,4 +178,123 @@ def test_store_verdict_if_new_skips_when_vector_lookup_never_called(
     """No claim text to store should mean no store call at all."""
     state = {"messages": [HumanMessage(content="claim")]}
     _store_verdict_if_new(state)
+    mock_store_verdict.assert_not_called()
+
+
+def _state_with_vector_lookup_claim(claim: str) -> dict:
+    """Minimal state with a recorded vector_lookup_tool call, same shape
+    _check_and_store_verdict / _store_verdict_if_new read claim text from.
+    """
+    return {
+        "messages": [
+            HumanMessage(content=claim),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "vector_lookup_tool", "args": {"claim": claim}, "id": "call_1"}
+                ],
+            ),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+        ]
+    }
+
+
+def test_extract_verdict_text_handles_plain_string() -> None:
+    assert _extract_verdict_text("A plain string answer.") == "A plain string answer."
+
+
+def test_extract_verdict_text_handles_list_content_blocks() -> None:
+    """Some Gemini responses come back as a list of content blocks instead
+    of a plain string — same shape main.py's _extract_text normalizes.
+    """
+    content = [{"type": "text", "text": "Part one. "}, {"type": "text", "text": "Part two."}]
+    assert _extract_verdict_text(content) == "Part one. Part two."
+
+
+@patch("agent.orchestrator_responses.check_verdict_completeness")
+@patch("agent.orchestrator_responses.store_verdict")
+def test_check_and_store_verdict_stores_when_complete(
+    mock_store_verdict: MagicMock, mock_check_completeness: MagicMock
+) -> None:
+    """A verdict judged complete should still only actually get cached if
+    _store_verdict_if_new itself finds a resolvable result to store — so
+    this state needs a real fact_check_lookup_tool result on record, same
+    as test_store_verdict_if_new_uses_vector_lookup_claim_text, not just a
+    bare vector_lookup_tool miss.
+    """
+    mock_check_completeness.return_value = True
+    claim = "The sky is green"
+    state = {
+        "messages": [
+            HumanMessage(content=claim),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "vector_lookup_tool", "args": {"claim": claim}, "id": "call_1"}
+                ],
+            ),
+            _tool_message("vector_lookup_tool", {"hit": False}),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fact_check_lookup_tool", "args": {"query": claim}, "id": "call_2"}
+                ],
+            ),
+            _tool_message(
+                "fact_check_lookup_tool",
+                {
+                    "claims": [
+                        {
+                            "rating": "False",
+                            "url": "https://a.com",
+                            "publisher": "X",
+                            "claim_text": claim,
+                        }
+                    ],
+                    "query_used": claim,
+                },
+            ),
+        ]
+    }
+    response = AIMessage(content="False. The sky is blue due to Rayleigh scattering.")
+
+    result = _check_and_store_verdict(state, response)
+
+    assert result is True
+    mock_store_verdict.assert_called_once()
+
+
+@patch("agent.orchestrator_responses.check_verdict_completeness")
+@patch("agent.orchestrator_responses.store_verdict")
+def test_check_and_store_verdict_skips_storage_when_incomplete(
+    mock_store_verdict: MagicMock, mock_check_completeness: MagicMock
+) -> None:
+    """An incomplete verdict must never be cached — it would otherwise get
+    reused for every future semantically-similar claim.
+    """
+    mock_check_completeness.return_value = False
+    state = _state_with_vector_lookup_claim("The sky is green")
+    response = AIMessage(content="Unclear.")
+
+    result = _check_and_store_verdict(state, response)
+
+    assert result is False
+    mock_store_verdict.assert_not_called()
+
+
+@patch("agent.orchestrator_responses.check_verdict_completeness")
+@patch("agent.orchestrator_responses.store_verdict")
+def test_check_and_store_verdict_skips_check_when_no_claim_on_record(
+    mock_store_verdict: MagicMock, mock_check_completeness: MagicMock
+) -> None:
+    """No vector_lookup_tool call on record means nothing to check or store
+    — same edge case _store_verdict_if_new already guards against.
+    """
+    state = {"messages": [HumanMessage(content="claim")]}
+    response = AIMessage(content="Some answer.")
+
+    result = _check_and_store_verdict(state, response)
+
+    assert result is True
+    mock_check_completeness.assert_not_called()
     mock_store_verdict.assert_not_called()

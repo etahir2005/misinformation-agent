@@ -28,6 +28,7 @@ Early build in progress. Currently implemented:
 - PII scrubbing (`agent/orchestrator.py`) — redacts email, credit card, IP, and MAC addresses out of every claim before it's processed, using LangChain's built-in `PIIMiddleware` (regex/algorithmic detection, no LLM call). Two layers: `scrub_pii()` is the authoritative scrub, called from `graph.py`'s `run_claim()` on the raw claim string before it's ever passed to `graph.invoke()` — necessary because LangGraph checkpoints the exact `invoke()` payload before running any node, so redacting inside the graph alone isn't early enough to keep raw PII out of Postgres (confirmed empirically via `graph.get_state_history()`, not assumed from graph structure). `pii_scrub_node` is a defense-in-depth backstop wired as the graph's first node (`START -> pii_scrub -> guardrail -> ...`) — it keeps what Gemini/tools/Langfuse see within a turn clean, and would cover any future caller that invokes the graph directly instead of going through `run_claim()`. Deliberately excludes the `url` PII type — users legitimately submit article URLs for `source_retrieval_tool` to fetch, and redacting those before the model ever sees them would silently break that feature
 - `agent/orchestrator_routing.py` — pure routing/decision helpers, split out of `orchestrator.py` so deterministic decision logic is easy to test in isolation
 - `agent/orchestrator_responses.py` — response-construction and cache-writing helpers (cache-hit responses, source gathering for scoring, verdict storage), also split out of `orchestrator.py`
+- `agent/verdict_completeness.py` — checks whether a claim's final verdict is complete enough to cache, gating `_check_and_store_verdict()` in `orchestrator_responses.py`: an incomplete verdict is never stored for future reuse, since caching a weak answer would multiply its harm across every future semantically-similar claim instead of containing it to one turn. Two layers, cheapest first: deterministic hard-fails (`VERDICT_MIN_WORD_COUNT`, no sources at all) catch the easy cases with zero LLM cost, since they can prove a verdict is *definitely* incomplete but can't prove one is complete on their own — a long, sourced answer can still be vague. Anything that clears those goes to an LLM judge (`JUDGE_MODEL_NAME`, default `gemini-3.5-flash-lite` — a separate model from `MODEL_NAME`, not the non-lite Flash tiers, which cap free-tier usage at 20 requests/day, nowhere near enough for consensus voting), called `JUDGE_CONSENSUS_CALLS` times (default 3) with a strict majority of *successful* calls required to agree "complete" — a single call would inherit the judge's own hallucination risk with no redundancy check. Judge-call errors fail closed (treated as "incomplete," never "complete"), and too many failed calls to trust any majority also fails closed rather than trusting a lone successful vote. Model is lazy-initialized, same pattern as `guardrail.py`/`vector_lookup_tool.py`
 - `agent/summarizer.py` — compresses older, fully-resolved turns into a running summary once a thread's history crosses `MAX_MESSAGES_BEFORE_SUMMARY`, so long-running threads don't exceed Gemini's context window. Never touches the turn currently in progress. Wired in as a `"summarize"` graph node, reached via `route_after_guardrail` once older history crosses the threshold — runs after the guardrail check (so greetings/off-topic messages never trigger it) and before the orchestrator. Model is lazy-initialized, same pattern as `vector_lookup_tool.py`
 - Tests for all five tools, the orchestrator's routing logic, the response-construction helpers, the guardrail classification and its graph wiring, the checkpointer, the shared graph helpers, the summarizer, and the FastAPI endpoints
 
@@ -81,6 +82,9 @@ RERANK_MIN_SCORE=0.5
 RERANK_MIN_MARGIN=0.15
 CLAIM_CACHE_MAX_AGE_DAYS=180
 MODEL_NAME=gemini-3.1-flash-lite
+JUDGE_MODEL_NAME=gemini-3.5-flash-lite
+VERDICT_MIN_WORD_COUNT=15
+JUDGE_CONSENSUS_CALLS=3
 POSTGRES_CONNECTION_STRING=
 JWT_SECRET_KEY=
 JWT_EXPIRY_MINUTES=30
@@ -154,6 +158,7 @@ agent/
   orchestrator_routing.py         # pure routing/decision helpers
   orchestrator_responses.py       # response-construction and cache-writing helpers
   guardrail.py                    # message intent classification (greeting/claim/out-of-scope)
+  verdict_completeness.py         # deterministic + LLM-judge check gating verdict caching
   summarizer.py                   # conversation summarization for long-running threads
   tools/
     _clients.py                    # shared third-party API clients
@@ -178,5 +183,6 @@ tests/
   test_source_retrieval_tool.py
   test_summarizer.py
   test_vector_lookup_tool.py
+  test_verdict_completeness.py
   test_web_search_tool.py
 ```
