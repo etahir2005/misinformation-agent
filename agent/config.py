@@ -44,7 +44,35 @@ LOW_CONFIDENCE_THRESHOLD = 0.5
 
 PINECONE_API_KEY: str = _require_env("PINECONE_API_KEY")
 PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "misinformation-agent-claims")
-CLAIM_SIMILARITY_THRESHOLD = 0.82
+
+# Two-stage retrieval for the semantic claim cache: Pinecone's cosine
+# similarity handles a cheap first pass over VECTOR_SEARCH_TOP_K
+# candidates; a CrossEncoder reranker then re-scores that smaller set more
+# accurately (too slow to run against the whole index, cheap enough
+# against a handful of candidates). This addresses the "curse of
+# dimensionality" concern — the single nearest neighbor by raw cosine
+# similarity isn't always the true best match in a high-dimensional space.
+VECTOR_SEARCH_TOP_K = int(os.getenv("VECTOR_SEARCH_TOP_K", "5"))
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-base")
+
+# Replaces the old flat CLAIM_SIMILARITY_THRESHOLD. A reranked candidate
+# is only reused if its score clears this floor AND — when more than one
+# candidate exists — beats the runner-up by at least RERANK_MIN_MARGIN. A
+# high score alone isn't enough evidence if a competing claim scored
+# almost as high; that usually means genuine ambiguity, not a confident
+# match, so the margin check catches cases the floor alone would miss.
+# Both are placeholder defaults for a BGE-style reranker's raw (unbounded,
+# not 0-1) relevance score — expect to tune them from the actual scores
+# observed during manual verification against real claims, not treat them
+# as fixed a priori constants the way the old cosine threshold was.
+RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.5"))
+RERANK_MIN_MARGIN = float(os.getenv("RERANK_MIN_MARGIN", "0.15"))
+
+# Cached claims older than this are excluded from lookup entirely, via a
+# Pinecone metadata filter on the query itself (not a post-hoc check) — a
+# verdict that was accurate a while ago may not reflect current consensus
+# on a fast-moving topic.
+CLAIM_CACHE_MAX_AGE_DAYS = int(os.getenv("CLAIM_CACHE_MAX_AGE_DAYS", "180"))
 
 # Once the messages preceding the current turn reach this count, they get
 # compressed into a running summary (see agent/summarizer.py) instead of
