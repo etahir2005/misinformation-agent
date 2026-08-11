@@ -3,8 +3,9 @@
 import logging
 from typing import Literal
 
+from langchain.agents.middleware import PIIMiddleware
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -47,6 +48,70 @@ TOOLS = [
 
 _EVIDENCE_TOOLS = [fact_check_lookup_tool, web_search_tool, source_retrieval_tool]
 
+# One PIIMiddleware instance per PII type — each instance only knows how to
+# detect/redact its own type, so scrubbing several types means chaining
+# several instances (see pii_scrub_node). Deliberately excludes "url": users
+# legitimately submit article URLs for source_retrieval_tool to fetch, and
+# redacting those before the model ever sees them would silently break that
+# feature entirely rather than protecting anyone's privacy.
+_PII_MIDDLEWARES = [
+    PIIMiddleware("email", strategy="redact"),
+    PIIMiddleware("credit_card", strategy="redact"),
+    PIIMiddleware("ip", strategy="redact"),
+    PIIMiddleware("mac_address", strategy="redact"),
+]
+
+
+def _apply_pii_middlewares(messages: list) -> tuple[list, bool]:
+    """Chain every configured PIIMiddleware instance over a message list.
+
+    Each instance only detects/redacts its own PII type, so scrubbing
+    several types means running them in sequence — each one needs to see
+    the previous one's redacted output, otherwise only the last-run type's
+    redaction would survive (e.g. an email redaction would be silently lost
+    if a later credit-card check reconstructed the message from the
+    original, unredacted text).
+
+    Shared by scrub_pii() (the authoritative, pre-invoke scrub) and
+    pii_scrub_node() (an in-graph defense-in-depth backstop) so both stay in
+    sync with exactly one implementation of the chaining logic.
+
+    Returns (possibly-redacted messages, whether anything was changed) —
+    the bool lets callers skip returning a no-op state update when nothing
+    was found, same as before_model() itself returning None for "no PII
+    here."
+    """
+    state = {"messages": messages}
+    any_modified = False
+    for middleware in _PII_MIDDLEWARES:
+        result = middleware.before_model(state, runtime=None)
+        if result is not None:
+            state = {**state, **result}
+            any_modified = True
+    return state["messages"], any_modified
+
+
+def scrub_pii(claim: str) -> str:
+    """Redact PII out of a raw claim string before it ever reaches the graph.
+
+    This — not pii_scrub_node — is the authoritative PII scrub. LangGraph
+    checkpoints the exact payload passed to graph.invoke() before running
+    any node, including the graph's own first node, so placing redaction
+    inside the graph isn't actually early enough to keep raw PII out of
+    Postgres. This was confirmed empirically, not assumed from graph
+    structure: a test walking graph.get_state_history() found the raw claim
+    still sitting in the earliest checkpoint snapshot even with
+    pii_scrub_node running first in the graph.
+
+    Called from graph.run_claim() on every turn's claim, before the
+    invoke() payload is ever built — the one place both main.py and cli.py
+    funnel every real request through, so scrubbing here covers every
+    actual caller in this codebase.
+    """
+    redacted_messages, _ = _apply_pii_middlewares([HumanMessage(content=claim)])
+    return redacted_messages[-1].content
+
+
 _GREETING_TEXT = (
     "Hi! Send me a claim you'd like fact-checked, or a link to an "
     "article, and I'll look into it."
@@ -67,6 +132,39 @@ class OrchestratorState(MessagesState):
     """
 
     intent_category: Literal["greeting", "claim", "out_of_scope"] | None
+
+
+def pii_scrub_node(state: OrchestratorState) -> dict:
+    """In-graph defense-in-depth backstop — not the primary PII defense.
+
+    scrub_pii() (agent/orchestrator.py, defined above) is the authoritative
+    scrub, called from graph.run_claim() on the raw claim string before
+    graph.invoke() is ever called. This node exists only to protect any
+    caller that invokes the compiled graph directly, bypassing run_claim()
+    — there's no such caller in this codebase today (both main.py and
+    cli.py go through run_claim()), but nothing at the graph level enforces
+    that, so this stays as cheap insurance rather than relying on every
+    future caller remembering to scrub first.
+
+    Note this cannot, by itself, keep raw PII out of Postgres for a direct
+    graph.invoke() call — LangGraph checkpoints the exact invoke() payload
+    before running any node, this one included (confirmed empirically via
+    get_state_history(), see scrub_pii()'s docstring). Running first in the
+    graph still matters for what Gemini, tools, and Langfuse traces see
+    within a single turn, just not for the very first checkpoint.
+
+    runtime=None is safe here even though PIIMiddleware.before_model()'s
+    signature expects a LangGraph Runtime object — this project builds a
+    hand-rolled StateGraph rather than using langchain's create_agent(),
+    which is what PIIMiddleware is designed to plug into automatically.
+    Reading its actual implementation confirmed before_model() never
+    touches the runtime argument, only state["messages"], so calling it
+    directly as a plain function (via _apply_pii_middlewares) is safe.
+    """
+    redacted_messages, any_modified = _apply_pii_middlewares(state["messages"])
+    if any_modified:
+        return {"messages": redacted_messages}
+    return {}
 
 
 def guardrail_node(state: OrchestratorState) -> dict:
@@ -205,12 +303,14 @@ def build_orchestrator(checkpointer: BaseCheckpointSaver) -> StateGraph:
         return {"messages": [response]}
 
     builder = StateGraph(OrchestratorState)
+    builder.add_node("pii_scrub", pii_scrub_node)
     builder.add_node("guardrail", guardrail_node)
     builder.add_node("summarize", summarize_node)
     builder.add_node("orchestrator", call_model)
     builder.add_node("tools", ToolNode(TOOLS))
 
-    builder.add_edge(START, "guardrail")
+    builder.add_edge(START, "pii_scrub")
+    builder.add_edge("pii_scrub", "guardrail")
     builder.add_conditional_edges("guardrail", route_after_guardrail)
     builder.add_edge("summarize", "orchestrator")
     builder.add_conditional_edges("orchestrator", tools_condition)

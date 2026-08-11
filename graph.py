@@ -12,7 +12,7 @@ import logging
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 
-from agent.orchestrator import build_orchestrator
+from agent.orchestrator import build_orchestrator, scrub_pii
 from agent.tracing import get_langfuse_handler
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
         before reaching a final answer, in which case "messages" holds
         whatever partial progress was made rather than a complete answer.
     """
+    claim = scrub_pii(claim)
     config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": _MAX_TOOL_LOOP_STEPS,

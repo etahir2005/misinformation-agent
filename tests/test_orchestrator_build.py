@@ -107,6 +107,37 @@ def test_different_thread_ids_have_independent_history(
 
 
 @patch("agent.guardrail._get_intent_model")
+@patch("agent.orchestrator.init_chat_model")
+def test_pii_is_redacted_before_reaching_checkpointed_state(
+    mock_init_chat_model: MagicMock, mock_get_intent_model: MagicMock
+) -> None:
+    """pii_scrub_node runs first in the compiled graph — confirms its
+    backstop redaction end to end via a direct graph.invoke() call, not just
+    as a standalone function call (see tests/test_pii_scrub.py for the
+    node's own unit tests). Note this only covers the *final* checkpointed
+    state: see tests/test_graph.py's PII test for why the graph node alone
+    can't keep a raw claim out of the *earliest* checkpoint, and why
+    scrub_pii() in graph.run_claim() is the actual authoritative defense.
+    """
+    mock_init_chat_model.return_value = _mock_model_returning("Answer.")
+    mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
+
+    graph = build_orchestrator(InMemorySaver())
+    config = {"configurable": {"thread_id": "pii-thread"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(content="Email me at jane@example.com about this claim.")]},
+        config=config,
+    )
+
+    state = graph.get_state(config)
+    human_messages = [m for m in state.values["messages"] if isinstance(m, HumanMessage)]
+
+    assert "jane@example.com" not in human_messages[0].content
+    assert "[REDACTED_EMAIL]" in human_messages[0].content
+
+
+@patch("agent.guardrail._get_intent_model")
 @patch("agent.orchestrator.summarize")
 @patch("agent.orchestrator.init_chat_model")
 def test_long_thread_triggers_summarization(
