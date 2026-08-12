@@ -1,5 +1,6 @@
 """Streamlit chat UI for the misinformation agent — talks to the FastAPI backend over HTTP."""
 
+import os
 import uuid
 
 import requests
@@ -8,7 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_URL = "http://localhost:8000"
+# Defaults to localhost for local (non-Docker) runs. Inside docker-compose,
+# containers can't reach each other via "localhost" — the ui container needs
+# the api container's *service name* instead — so docker-compose.yml
+# overrides this via the API_URL environment variable, pointing it at
+# http://api:8000.
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 REQUEST_TIMEOUT_SECONDS = 120
 
 st.set_page_config(

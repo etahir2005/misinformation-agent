@@ -1,0 +1,15 @@
+.env
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.md
+tests/
+cli.py
+demo_summary_check.py
+code_walkthrough_prep.md
+demo_script.md
+test_gemma_availability.py
+venv/

@@ -1,0 +1,28 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: "1.5"
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/streamlit.Dockerfile
+    env_file: .env
+    environment:
+      # Overrides app.py's localhost default — inside the compose network,
+      # the ui container must reach the api container by its service name.
+      - API_URL=http://api:8000
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: "1.5"
+    depends_on:
+      - api

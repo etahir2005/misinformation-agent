@@ -33,7 +33,9 @@ Early build in progress. Currently implemented:
 - Human-in-the-loop escalation (`agent/orchestrator.py`) — foundation piece only: proves the pause/resume mechanics work, doesn't yet notify anyone or let a human respond (that's the Slack tool and Streamlit approval UI, both still to come). `route_after_orchestrator` replaces `langgraph.prebuilt.tools_condition` as the graph's post-orchestrator routing: continues the tool loop as before when there are more tool calls, but now also checks `verdict_is_complete` (set by `_check_and_store_verdict`, see `agent/verdict_completeness.py` above) — a final answer judged incomplete routes to a new `"human_review"` node instead of ending the graph outright; complete (or unset, e.g. greetings/cache hits) ends normally. `human_review_node` calls LangGraph's `interrupt()`, which pauses graph execution there and requires the checkpointer this project already has. `graph.py`'s `run_claim()` surfaces this as an additive `"pending_review"` key in its return dict (`None` when nothing's pending) — existing callers that don't check it are unaffected. Confirmed empirically, not just from documentation, that `graph.invoke()` returns a `"__interrupt__"` key holding the paused node's payload rather than raising or hanging
 - Tests for all five tools, the orchestrator's routing logic, the response-construction helpers, the guardrail classification and its graph wiring, the checkpointer, the shared graph helpers, the summarizer, and the FastAPI endpoints
 
-Planned next: human-in-the-loop review, Docker Compose deployment.
+- Docker Compose deployment (`docker/api.Dockerfile`, `docker/streamlit.Dockerfile`, `docker-compose.yml`) — mirrors the security pattern already established in the sibling `medical-triage-assistant` project: multi-stage builds (build tools discarded from the final image), base image pinned by SHA256 digest rather than a mutable tag, secrets injected only via `env_file: .env` at container *runtime* (never baked into an image layer via `ARG`/`ENV`), a non-root `appuser` running both containers, and a `.dockerignore` that excludes `.env` from the build context entirely so it can never end up in an image even by accident. The `api` image pre-downloads both `sentence-transformers` models (`BAAI/bge-base-en-v1.5` and `BAAI/bge-reranker-base`) at build time with `HF_HUB_OFFLINE=1` as the runtime default, so the running container never needs a live Hugging Face connection. Each image installs only what it actually runs, not the full `requirements.txt` (which also covers local dev, so it includes `pytest`/`ruff`/`streamlit` together): the `api` image uses `requirements-api.txt` (excludes `streamlit` and its dependency tree, plus `pytest`/`ruff`), and the `ui` image uses `requirements-streamlit.txt` (`app.py` is a pure HTTP client with no LangGraph/ML dependency, unlike the reference project's UI). `app.py`'s `API_URL` is now read from an `API_URL` env var (default `http://localhost:8000` for local runs) so `docker-compose.yml` can point the `ui` container at the `api` container by service name (`http://api:8000`) instead of `localhost`, which wouldn't resolve across containers
+
+Planned next: human-in-the-loop review (Slack notify + escalation tool, Streamlit approval UI).
 
 ## Architecture
 
@@ -125,6 +127,19 @@ python -m pytest
 python -m ruff check .
 ```
 
+## Docker
+
+Runs the same `.env` file as the non-Docker setup above — no separate secrets configuration. Nothing from `.env` is ever baked into an image: both Dockerfiles only read secrets via `env_file: .env` at container start, and `.dockerignore` excludes `.env` from the build context so it can't be copied in even by accident.
+
+```
+docker compose up --build
+```
+
+- API: http://localhost:8000
+- Streamlit UI: http://localhost:8501
+
+`docker compose down` to stop. The `api` image is larger and slower to build the first time — it pre-downloads two ML models at build time (see Status above) so the running container starts up without needing a live Hugging Face connection.
+
 ## Tech stack
 
 - LangGraph / LangChain — agent orchestration
@@ -148,6 +163,13 @@ graph.py                       # shared graph build + invoke logic
 main.py                        # FastAPI app wrapping the graph
 app.py                         # Streamlit chat UI, calls main.py over HTTP
 cli.py                         # manual CLI entry point for one-off testing
+docker-compose.yml             # api + ui services, both env_file-fed from .env
+docker/
+  api.Dockerfile                  # FastAPI image, pre-bakes both ML models at build time
+  streamlit.Dockerfile            # Streamlit image, uses requirements-streamlit.txt
+requirements-api.txt           # api image deps only (no streamlit, no pytest/ruff)
+requirements-streamlit.txt     # lightweight deps for the ui image (no ML/LangGraph)
+.dockerignore                  # excludes .env, tests/, and other non-runtime files from build context
 agent/
   config.py                       # env var loading, logging setup
   checkpointer.py                 # Postgres (Neon) checkpointer factory
