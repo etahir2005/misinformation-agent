@@ -1,0 +1,14 @@
+[theme]
+# Matches the "investigation desk" dark palette already defined in
+# app.py's injected CSS (_THEME_CSS's :root variables) — without this
+# file, Streamlit's *native* chrome (buttons, tabs, expanders, inputs,
+# the top header bar, focus rings, etc.) still renders in Streamlit's
+# own default light-ish theme regardless of the custom .stApp background
+# CSS override, since that CSS only ever targeted a few specific
+# elements. Every native widget below now follows this palette
+# automatically instead of clashing against the custom dark background.
+base = "dark"
+primaryColor = "#2dd4bf"
+backgroundColor = "#0b1120"
+secondaryBackgroundColor = "#141b2d"
+textColor = "#e2e8f0"

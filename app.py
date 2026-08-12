@@ -1,6 +1,8 @@
 """Streamlit chat UI for the misinformation agent — talks to the FastAPI backend over HTTP."""
 
 import os
+import threading
+import time
 import uuid
 
 import requests
@@ -149,6 +151,65 @@ div[data-testid="stChatMessage"] {
 footer, header[data-testid="stHeader"] {
     background: transparent;
 }
+
+/* The conversation row + its delete button sit in a 2-column st.columns()
+   row. When a long conversation title wraps to two lines, that column
+   grows taller than the single-line delete button next to it, and by
+   default Streamlit top-aligns columns — so the trash icon ends up
+   sitting near the top of the row instead of centered on the title.
+   Vertically centering the row's contents fixes that regardless of how
+   many lines the title wraps to. */
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
+    align-items: center;
+}
+
+/* Buttons, tabs, expanders, and inputs already pick up the base dark
+   palette from .streamlit/config.toml — these are small additive
+   refinements on top of that (rounded corners, accent-colored focus/
+   active states, tighter expander styling) rather than a full override,
+   so a Streamlit upgrade that changes internal markup only loses these
+   nice-to-haves, not core readability. */
+div[data-testid="stButton"] button {
+    border-radius: 8px;
+    transition: border-color 0.15s ease, transform 0.05s ease;
+}
+div[data-testid="stButton"] button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+div[data-testid="stButton"] button:active {
+    transform: scale(0.98);
+}
+
+div[data-testid="stExpander"] {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+div[data-testid="stChatInput"] textarea {
+    border-radius: 12px;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.4rem;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+}
+
+div[data-testid="stForm"] {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.2rem 1.3rem 0.6rem 1.3rem;
+}
+
+.sidebar-empty-state {
+    font-size: 0.82rem;
+    color: var(--text-dim);
+    padding: 0.6rem 0.2rem 0.9rem 0.2rem;
+}
 </style>
 """
 
@@ -193,21 +254,54 @@ def _apply_refreshed_token(response: requests.Response) -> None:
         st.session_state.access_token = new_token
 
 
-def _fetch_conversations() -> list[dict]:
+@st.cache_data(ttl=5, show_spinner=False)
+def _fetch_conversations_cached(access_token: str) -> list[dict]:
+    """The actual cached fetch — only ever called with a real, successful
+    result to cache. Deliberately doesn't catch request errors itself (see
+    _fetch_conversations() below for why).
+
+    Cached for a few seconds so the sidebar list isn't re-fetched twice
+    in a row for nothing: several sidebar actions below (switching a
+    conversation, deleting one) mutate session_state and then call
+    st.rerun() themselves on top of the rerun Streamlit already runs for
+    the click — that's two full script executions per click, and this
+    function is called unconditionally on every one of them. The TTL is
+    short enough that a genuinely new conversation list (e.g. from another
+    browser tab) still shows up within a few seconds; any action *in this
+    tab* that actually changes the list (delete) explicitly clears the
+    cache itself below rather than waiting out the TTL.
+
+    access_token is taken as an explicit argument (rather than read from
+    st.session_state inside the function) specifically so Streamlit's
+    cache — which is keyed by argument values, not by session — doesn't
+    hand one signed-in user's cached conversation list to a different
+    signed-in user calling this within the same TTL window.
+    """
+    response = requests.get(
+        f"{API_URL}/conversations",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    _apply_refreshed_token(response)
+    return response.json()
+
+
+def _fetch_conversations(access_token: str) -> list[dict]:
     """Fetch the signed-in user's conversation list for the sidebar.
 
     Fails soft — an unreachable backend just means an empty sidebar list
     for this render, not a crash, since this runs on every rerun.
+
+    The try/except lives in this uncached wrapper, not in the cached
+    function itself: if a transient failure were cached, the empty-list
+    fallback would be pinned for the full TTL, so the sidebar would stay
+    stuck empty for up to 5 seconds even after the backend recovers,
+    instead of the very next rerun trying again. Only real successful
+    results get cached; failures always retry on the next call.
     """
     try:
-        response = requests.get(
-            f"{API_URL}/conversations",
-            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        _apply_refreshed_token(response)
-        return response.json()
+        return _fetch_conversations_cached(access_token)
     except requests.exceptions.RequestException:
         return []
 
@@ -220,6 +314,7 @@ def _load_conversation(thread_id: str) -> None:
     st.session_state.messages is purely client-side and has no memory of
     it until fetched explicitly.
     """
+    response = None
     try:
         response = requests.get(
             f"{API_URL}/conversations/{thread_id}/messages",
@@ -233,6 +328,18 @@ def _load_conversation(thread_id: str) -> None:
         st.session_state.messages = [
             {"role": m["role"], "content": m["content"]} for m in data["messages"]
         ]
+    except requests.exceptions.HTTPError:
+        # response.raise_for_status() lands here for any 4xx/5xx — a
+        # reached-but-rejected request, not an unreachable backend. The
+        # generic "is the API running?" message below is for the other
+        # except clause (a real connection failure) and was previously
+        # also catching this case, since HTTPError is itself a
+        # RequestException subclass and there was no separate branch for it.
+        if response is not None and response.status_code == 403:
+            st.error("That conversation belongs to a different account.")
+        else:
+            status = response.status_code if response is not None else "unknown"
+            st.error(f"Couldn't load that conversation (error {status}).")
     except requests.exceptions.RequestException:
         st.error("Couldn't load that conversation — is the API running?")
 
@@ -259,20 +366,32 @@ def _delete_conversation(thread_id: str) -> bool:
         return False
 
 
-def _fetch_pending_escalations() -> list[dict]:
+@st.cache_data(ttl=5, show_spinner=False)
+def _fetch_pending_escalations_cached(access_token: str) -> list[dict]:
+    """The actual cached fetch — see _fetch_conversations_cached's
+    docstring for why request errors are deliberately not caught here."""
+    response = requests.get(
+        f"{API_URL}/admin/escalations",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    _apply_refreshed_token(response)
+    return response.json()
+
+
+def _fetch_pending_escalations(access_token: str) -> list[dict]:
     """Fetch the admin-only review queue. Fails soft, same convention as
     _fetch_conversations — an unreachable backend or a non-admin account
     (403) just means an empty list for this render, not a crash.
+
+    See _fetch_conversations() for why the try/except lives in this
+    uncached wrapper rather than in the cached function. Approving or
+    rejecting an item explicitly clears the cache below rather than
+    waiting out the TTL.
     """
     try:
-        response = requests.get(
-            f"{API_URL}/admin/escalations",
-            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        _apply_refreshed_token(response)
-        return response.json()
+        return _fetch_pending_escalations_cached(access_token)
     except requests.exceptions.RequestException:
         return []
 
@@ -298,14 +417,23 @@ if "access_token" not in st.session_state:
     st.session_state.access_token = None
 
 if st.session_state.access_token is None:
-    st.markdown("## 🔎 Misinformation Agent — Sign in")
+    st.markdown(
+        """<div class="agent-header">
+            <div class="icon">🔎</div>
+            <div class="titles">
+                <h1>Misinformation Agent</h1>
+                <p>Sign in to check a claim, or create an account to get started.</p>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
     login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
 
     with login_tab:
         with st.form("login_form"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
-            if st.form_submit_button("Log in") and email and password:
+            if st.form_submit_button("Log in", type="primary") and email and password:
                 token = _auth_request("login", email, password)
                 if token:
                     st.session_state.access_token = token
@@ -329,7 +457,7 @@ if st.session_state.access_token is None:
             password = st.text_input(
                 "Password (min 8 characters)", type="password", key="signup_password"
             )
-            if st.form_submit_button("Sign up") and email and password:
+            if st.form_submit_button("Sign up", type="primary") and email and password:
                 token = _auth_request("signup", email, password)
                 if token:
                     st.session_state.access_token = token
@@ -366,12 +494,42 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if st.button("🗑️  New conversation", use_container_width=True):
+    if ADMIN_EMAIL and st.session_state.get("user_email") == ADMIN_EMAIL:
+        pending = _fetch_pending_escalations(st.session_state.access_token)
+        st.markdown(f"### 🛡️ Pending Reviews ({len(pending)})")
+        for item in pending:
+            preview = item["claim"][:60] + ("…" if len(item["claim"]) > 60 else "")
+            with st.expander(preview):
+                st.markdown(f"**Verdict:** {item['verdict']}")
+                st.markdown(f"**Flagged because:** {item['reason']}")
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    if st.button(
+                        "✅ Approve",
+                        key=f"approve_{item['thread_id']}",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        if _resolve_escalation(item["thread_id"], "approve"):
+                            _fetch_pending_escalations_cached.clear()
+                            st.rerun()
+                with reject_col:
+                    if st.button(
+                        "❌ Reject",
+                        key=f"reject_{item['thread_id']}",
+                        use_container_width=True,
+                    ):
+                        if _resolve_escalation(item["thread_id"], "reject"):
+                            _fetch_pending_escalations_cached.clear()
+                            st.rerun()
+        st.divider()
+
+    if st.button("➕  New conversation", use_container_width=True, type="primary"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
 
-    conversations = _fetch_conversations()
+    conversations = _fetch_conversations(st.session_state.access_token)
     if conversations:
         st.markdown("### Conversations")
         for convo in conversations:
@@ -386,7 +544,11 @@ with st.sidebar:
                     st.rerun()
             with delete_col:
                 if st.button(
-                    "🗑️", key=f"delete_{convo['thread_id']}", use_container_width=True
+                    "🗑️",
+                    key=f"delete_{convo['thread_id']}",
+                    use_container_width=True,
+                    type="tertiary",
+                    help="Delete this conversation",
                 ):
                     if _delete_conversation(convo["thread_id"]):
                         # If the conversation being deleted is the one
@@ -397,11 +559,22 @@ with st.sidebar:
                         if is_active:
                             st.session_state.thread_id = str(uuid.uuid4())
                             st.session_state.messages = []
+                        # Without this, the rerun below would still hit the
+                        # cache populated earlier in *this same* run (from
+                        # before the delete happened) and briefly show the
+                        # just-deleted conversation again.
+                        _fetch_conversations_cached.clear()
                         st.rerun()
+    else:
+        st.markdown(
+            '<div class="sidebar-empty-state">No conversations yet — '
+            "check a claim below to start one.</div>",
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
-    if st.button("🚪  Log out", use_container_width=True):
+    if st.button("🚪  Log out", use_container_width=True, type="tertiary"):
         # Clearing access_token drops back to the login gate on rerun.
         # thread_id/messages are also reset so that if the same or a
         # different person logs back in on this tab, they start clean
@@ -412,33 +585,6 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.user_email = None
         st.rerun()
-
-    if ADMIN_EMAIL and st.session_state.get("user_email") == ADMIN_EMAIL:
-        st.divider()
-        pending = _fetch_pending_escalations()
-        st.markdown(f"### 🛡️ Pending Reviews ({len(pending)})")
-        for item in pending:
-            preview = item["claim"][:60] + ("…" if len(item["claim"]) > 60 else "")
-            with st.expander(preview):
-                st.markdown(f"**Verdict:** {item['verdict']}")
-                st.markdown(f"**Flagged because:** {item['reason']}")
-                approve_col, reject_col = st.columns(2)
-                with approve_col:
-                    if st.button(
-                        "✅ Approve",
-                        key=f"approve_{item['thread_id']}",
-                        use_container_width=True,
-                    ):
-                        if _resolve_escalation(item["thread_id"], "approve"):
-                            st.rerun()
-                with reject_col:
-                    if st.button(
-                        "❌ Reject",
-                        key=f"reject_{item['thread_id']}",
-                        use_container_width=True,
-                    ):
-                        if _resolve_escalation(item["thread_id"], "reject"):
-                            st.rerun()
 
     with st.expander("How this works"):
         st.markdown(
@@ -487,47 +633,102 @@ if claim:
 
     with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
         banner = None
-        with st.spinner(_SPINNER_MESSAGES[0]):
+
+        # The backend does this as one blocking call with no progress
+        # signal in between (no streaming/SSE) — there's no real "which
+        # stage is it on" event to react to. Rather than pin one spinner
+        # message for the whole 60-80s wait (which previously used only
+        # _SPINNER_MESSAGES[0] and left [1]/[2] unused dead code), the
+        # actual request runs in a background thread while the main
+        # thread cycles the message on a timer. This is an honest
+        # approximation of progress based on elapsed time, not a report
+        # of the backend's real internal state — but it's a closer match
+        # to what's actually happening than a single frozen message, and
+        # it means the UI can keep checking (every 0.5s) whether the
+        # request has actually finished instead of committing to a fixed
+        # wait. Streamlit calls (st.empty(), etc.) only ever happen on
+        # the main thread here — the background thread only does the
+        # network call itself.
+        _result: dict = {}
+
+        def _run_request() -> None:
             try:
-                response = requests.post(
+                _result["response"] = requests.post(
                     f"{API_URL}/chat",
                     json={"claim": claim, "thread_id": st.session_state.thread_id},
                     headers={"Authorization": f"Bearer {st.session_state.access_token}"},
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-                response.raise_for_status()
-                _apply_refreshed_token(response)
-                data = response.json()
-                answer = data["answer"]
-                if data.get("recursion_limit_hit"):
-                    banner = ("partial", "⚠️ Partial result — step limit reached")
-                else:
-                    banner = ("ok", "✅ Verdict reached")
-            except requests.exceptions.ConnectionError:
-                answer = "Couldn't reach the fact-checking service — is the API running?"
-                banner = ("error", "⛔ Connection failed")
-            except requests.exceptions.Timeout:
-                answer = "The request took too long and timed out. Please try again."
-                banner = ("error", "⛔ Timed out")
-            except requests.exceptions.HTTPError:
-                if response.status_code in (401, 403):
-                    st.session_state.access_token = None
-                    st.rerun()
-                if response.status_code == 409:
-                    # A claim rejected because this thread has a review
-                    # still pending (main.py's /chat) — the backend's own
-                    # detail message explains this clearly; a generic
-                    # "please try again" would be actively misleading here,
-                    # since retrying the same message won't help until the
-                    # pending review is resolved.
-                    answer = response.json().get("detail", "This conversation is on hold.")
-                    banner = ("partial", "⏸️ Awaiting review")
-                else:
-                    answer = "The request failed — please try again."
-                    banner = ("error", "⛔ Request failed")
-            except requests.exceptions.RequestException as exc:
-                answer = f"Something went wrong: {exc}"
+            except Exception as exc:  # noqa: BLE001 - deliberately broad: this
+                # runs on a background thread, so an uncaught exception here
+                # doesn't propagate to Streamlit at all — it just gets eaten
+                # by the thread and dumped to stderr, leaving _result empty
+                # and the main thread below to hit a bare KeyError instead of
+                # a clean message. Catching everything here guarantees the
+                # main thread always has something in _result to react to,
+                # even for a failure type nobody anticipated (not just the
+                # requests.exceptions.RequestException family below).
+                _result["exc"] = exc
+
+        _worker = threading.Thread(target=_run_request, daemon=True)
+        _worker.start()
+
+        _SPINNER_STAGE_SECONDS = 15
+        _spinner_placeholder = st.empty()
+        _start_time = time.time()
+        while _worker.is_alive():
+            elapsed = time.time() - _start_time
+            stage = min(int(elapsed // _SPINNER_STAGE_SECONDS), len(_SPINNER_MESSAGES) - 1)
+            _spinner_placeholder.markdown(f"⏳ *{_SPINNER_MESSAGES[stage]}*")
+            time.sleep(0.5)
+        _worker.join()
+        _spinner_placeholder.empty()
+
+        try:
+            if "exc" in _result:
+                raise _result["exc"]
+            response = _result["response"]
+            response.raise_for_status()
+            _apply_refreshed_token(response)
+            data = response.json()
+            answer = data["answer"]
+            if data.get("recursion_limit_hit"):
+                banner = ("partial", "⚠️ Partial result — step limit reached")
+            else:
+                banner = ("ok", "✅ Verdict reached")
+        except requests.exceptions.ConnectionError:
+            answer = "Couldn't reach the fact-checking service — is the API running?"
+            banner = ("error", "⛔ Connection failed")
+        except requests.exceptions.Timeout:
+            answer = "The request took too long and timed out. Please try again."
+            banner = ("error", "⛔ Timed out")
+        except requests.exceptions.HTTPError:
+            if response.status_code in (401, 403):
+                st.session_state.access_token = None
+                st.rerun()
+            if response.status_code == 409:
+                # A claim rejected because this thread has a review
+                # still pending (main.py's /chat) — the backend's own
+                # detail message explains this clearly; a generic
+                # "please try again" would be actively misleading here,
+                # since retrying the same message won't help until the
+                # pending review is resolved.
+                answer = response.json().get("detail", "This conversation is on hold.")
+                banner = ("partial", "⏸️ Awaiting review")
+            else:
+                answer = "The request failed — please try again."
                 banner = ("error", "⛔ Request failed")
+        except requests.exceptions.RequestException as exc:
+            answer = f"Something went wrong: {exc}"
+            banner = ("error", "⛔ Request failed")
+        except Exception as exc:  # noqa: BLE001 - last-resort catch-all so
+            # an unexpected error (a malformed response, a bug in the
+            # threaded call above, anything not already handled by the
+            # requests.exceptions branches) still ends the turn with a
+            # visible message in the chat instead of crashing the whole
+            # Streamlit script with a raw traceback mid-demo.
+            answer = f"Something unexpected went wrong: {exc}"
+            banner = ("error", "⛔ Unexpected error")
 
         if banner:
             st.markdown(

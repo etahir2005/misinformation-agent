@@ -453,14 +453,20 @@ def get_conversation_messages(
     unknown thread_id (owner_id is None) is also rejected rather than
     treated as an empty-but-valid conversation, since it was never
     created through this user's own /chat calls.
+
+    Fetches the thread's state once and derives both the owner check and
+    the message list from that single object, rather than calling
+    _get_thread_owner() (which does its own internal get_state() call)
+    and then calling get_state() again separately — the previous version
+    did two Postgres checkpoint reads for what only ever needs one.
     """
-    owner_id = _get_thread_owner(app.state.graph, thread_id)
+    state = app.state.graph.get_state({"configurable": {"thread_id": thread_id}})
+    owner_id = state.metadata.get("user_id") if state and state.metadata else None
     if owner_id is None or owner_id != current_user["id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This conversation belongs to a different account.",
         )
-    state = app.state.graph.get_state({"configurable": {"thread_id": thread_id}})
     raw_messages = state.values.get("messages", []) if state else []
     return ConversationHistoryResponse(
         thread_id=thread_id, messages=_to_conversation_messages(raw_messages)
