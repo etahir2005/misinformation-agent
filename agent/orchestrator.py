@@ -16,6 +16,7 @@ from agent.guardrail import classify_message_intent
 from agent.orchestrator_responses import (
     _build_cache_hit_response,
     _check_and_store_verdict,
+    _extract_verdict_text,
     _gather_sources_for_scoring,
     _store_verdict_if_new,
 )
@@ -276,7 +277,18 @@ def human_review_node(state: OrchestratorState) -> dict:
         {
             "reason": "verdict_incomplete",
             "claim": latest_human_message.content,
-            "verdict": final_answer.content,
+            # Gemini responses can come back as a list of content blocks
+            # instead of a plain string (see _extract_verdict_text's own
+            # docstring) — raw final_answer.content was passed here before,
+            # which worked fine for main.py's ChatResponse (already
+            # normalized via its own _extract_text) but broke
+            # create_escalation()'s SQL insert whenever content wasn't a
+            # plain str: psycopg can't adapt a dict/list to a text column.
+            # Caught live, not by the (fully mocked) test suite — the
+            # escalation write failed silently (fail-soft, by design) so
+            # the chat request still succeeded with 200, but nothing ever
+            # showed up in the admin queue.
+            "verdict": _extract_verdict_text(final_answer.content),
         }
     )
     if decision == "approve":

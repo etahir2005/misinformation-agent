@@ -114,6 +114,7 @@ def test_resume_review_invokes_with_command_resume_scoped_to_thread() -> None:
     thread paused at human_review_node (agent/orchestrator.py).
     """
     mock_graph = MagicMock()
+    mock_graph.get_state.return_value.metadata = {"user_id": "user-abc"}
 
     resume_review(mock_graph, "some-thread-id", "approve")
 
@@ -123,3 +124,52 @@ def test_resume_review_invokes_with_command_resume_scoped_to_thread() -> None:
     assert isinstance(resume_command, Command)
     assert resume_command.resume == "approve"
     assert kwargs["config"]["configurable"]["thread_id"] == "some-thread-id"
+
+
+def test_resume_review_preserves_thread_ownership_metadata() -> None:
+    """Regression test for a live bug: LangGraph checkpoint metadata isn't
+    cumulative across invokes — each call's metadata only applies to the
+    checkpoint(s) that call writes, it doesn't carry forward from the
+    thread's prior checkpoints automatically. run_claim() always sets
+    metadata={"user_id": ...}; resume_review() originally invoked with no
+    metadata at all, so the checkpoint(s) written by the admin's
+    approve/reject ended up with no user_id, and main.py's
+    _get_thread_owner() (which reads the *latest* checkpoint's metadata)
+    would then see the thread as ownerless — silently breaking that user's
+    ability to continue, view, or delete their own conversation. Caught
+    live: after an admin resolved an escalation, the original user got a
+    403 "belongs to a different account" on their own thread, and a later
+    message on that thread hit a duplicate-key error trying to re-create
+    its sidebar conversation row (main.py treated it as brand new).
+
+    Uses a real graph + InMemorySaver (not a mock) so this actually proves
+    the fix against LangGraph's real metadata behavior, not an assumption
+    about it.
+    """
+    from typing import TypedDict
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    class _State(TypedDict):
+        value: str
+
+    def _pausing_node(state: _State) -> dict:
+        interrupt({"reason": "test_pause"})
+        return {"value": "resumed"}
+
+    builder = StateGraph(_State)
+    builder.add_node("pause", _pausing_node)
+    builder.add_edge(START, "pause")
+    builder.add_edge("pause", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    thread_id = "ownership-metadata-thread"
+    config = {"configurable": {"thread_id": thread_id}, "metadata": {"user_id": "user-123"}}
+    graph.invoke({"value": "start"}, config=config)
+
+    resume_review(graph, thread_id, "approve")
+
+    final_state = graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert final_state.metadata.get("user_id") == "user-123"

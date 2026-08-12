@@ -119,6 +119,26 @@ def resume_review(graph, thread_id: str, decision: str) -> None:
     No PII-scrub or recursion-limit handling needed here unlike run_claim()
     — this doesn't process new user input, it only unblocks a node that's
     already paused mid-graph, so neither concern applies.
+
+    Re-attaches the thread's existing owner as metadata before resuming.
+    LangGraph checkpoint metadata isn't cumulative across invokes — each
+    call's metadata only applies to the checkpoint(s) that call writes, it
+    doesn't carry forward from the thread's prior checkpoints on its own.
+    run_claim() always sets metadata={"user_id": ...} on the checkpoint it
+    creates; without re-passing that here, the checkpoint(s) written by
+    this resumed run would end up with no user_id at all, and
+    main.py's _get_thread_owner() (which reads the *latest* checkpoint's
+    metadata) would then see the thread as ownerless — silently breaking
+    that user's ability to continue, view, or delete their own
+    conversation the moment an admin resolves its escalation. Confirmed
+    empirically with a standalone interrupt/resume graph: a resume with no
+    metadata drops user_id from the next checkpoint entirely; re-passing
+    the looked-up owner_id here keeps it intact.
     """
     config = {"configurable": {"thread_id": thread_id}}
-    graph.invoke(Command(resume=decision), config=config)
+    state = graph.get_state(config)
+    owner_id = state.metadata.get("user_id") if state and state.metadata else None
+    resume_config = {"configurable": {"thread_id": thread_id}}
+    if owner_id:
+        resume_config["metadata"] = {"user_id": owner_id}
+    graph.invoke(Command(resume=decision), config=resume_config)

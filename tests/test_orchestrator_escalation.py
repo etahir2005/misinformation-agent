@@ -91,6 +91,39 @@ def test_human_review_node_calls_interrupt_with_claim_and_verdict(
 
 @patch("agent.orchestrator._store_verdict_if_new")
 @patch("agent.orchestrator.interrupt")
+def test_human_review_node_extracts_verdict_text_from_list_style_content(
+    mock_interrupt: MagicMock, mock_store: MagicMock
+) -> None:
+    """Regression test: caught live, not by the (previously fully mocked)
+    test suite. Gemini responses can come back as a list of content blocks
+    instead of a plain string (same shape orchestrator_responses.py's
+    _extract_verdict_text already handles for _check_and_store_verdict) —
+    human_review_node used to pass final_answer.content into the interrupt
+    payload raw, which worked fine when content happened to be a plain
+    str, but broke create_escalation()'s SQL insert (psycopg can't adapt a
+    list/dict to a text column) whenever a real response came back in this
+    list shape. The chat request itself still succeeded (main.py's
+    ChatResponse already normalizes separately via _extract_text), which is
+    exactly why this was invisible until someone checked the admin queue
+    and found it empty.
+    """
+    mock_interrupt.return_value = None
+    state = {
+        "messages": [
+            HumanMessage(content="Is the sky green?"),
+            AIMessage(content=[{"type": "text", "text": "The evidence is unclear."}]),
+        ],
+        "verdict_is_complete": False,
+    }
+
+    human_review_node(state)
+
+    payload = mock_interrupt.call_args[0][0]
+    assert payload["verdict"] == "The evidence is unclear."
+
+
+@patch("agent.orchestrator._store_verdict_if_new")
+@patch("agent.orchestrator.interrupt")
 def test_human_review_node_stores_verdict_when_admin_approves(
     mock_interrupt: MagicMock, mock_store: MagicMock
 ) -> None:
