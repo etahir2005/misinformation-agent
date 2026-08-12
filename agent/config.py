@@ -117,6 +117,16 @@ JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "30"))
 # different deployments may want a much shorter or longer window.
 CONVERSATION_RETENTION_DAYS: int = int(os.getenv("CONVERSATION_RETENTION_DAYS", "10"))
 
+# The single reviewer account for human-in-the-loop escalations (see
+# agent/orchestrator.py's human_review_node and agent/escalations_db.py).
+# Deliberately a static email compared against the logged-in user rather
+# than a database role column — this project has no broader admin/role
+# system, and a config value is a one-line change if the reviewer account
+# ever needs to swap, with no migration required. Optional and fails
+# closed: unset means no account — not even a real signed-in one — can
+# reach an admin endpoint (see main.py's require_admin).
+ADMIN_EMAIL: str | None = os.getenv("ADMIN_EMAIL")
+
 SYSTEM_PROMPT: str = (
     "You are a fact-checking assistant. Given a claim, first use "
     "vector_lookup_tool to check whether a semantically similar claim has "

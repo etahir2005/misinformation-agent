@@ -54,6 +54,17 @@ def client():
     Tests that specifically exercise the retention purge build their own
     TestClient instead of using this fixture, same pattern already used
     by test_chat_flattens_list_style_message_content below.
+
+    main.get_pending_escalation is patched to return None by default for
+    the same reason as purge_stale_conversations above, but with a sharper
+    failure mode if left unpatched: /chat calls it on every message to an
+    existing thread (see the pending-review guard in main.py's chat()), and
+    an unpatched real call against the mocked pool returns a MagicMock
+    result — which is truthy and not None, so the guard would wrongly
+    reject every second message on any thread as "pending review" rather
+    than simply erroring loudly. Caught by actually running the full suite,
+    not by ruff or import-time checks alone. Tests that specifically
+    exercise the pending-review guard override this default explicitly.
     """
     mock_model = MagicMock()
     mock_model.bind_tools.return_value = mock_model
@@ -76,8 +87,12 @@ def client():
     ) as mock_build_pool, patch(
         "main.build_checkpointer", return_value=InMemorySaver()
     ), patch("main.setup_users_table"), patch("main.setup_conversations_table"), patch(
+        "main.setup_escalations_table"
+    ), patch(
         "main.create_conversation"
     ), patch("main.touch_conversation"), patch(
+        "main.get_pending_escalation", return_value=None
+    ), patch(
         "main.purge_stale_conversations", return_value=[]
     ):
         mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
@@ -270,8 +285,12 @@ def test_chat_flattens_list_style_message_content() -> None:
     ) as mock_build_pool, patch(
         "main.build_checkpointer", return_value=InMemorySaver()
     ), patch("main.setup_users_table"), patch("main.setup_conversations_table"), patch(
+        "main.setup_escalations_table"
+    ), patch(
         "main.create_conversation"
     ), patch("main.touch_conversation"), patch(
+        "main.get_pending_escalation", return_value=None
+    ), patch(
         "main.purge_stale_conversations", return_value=[]
     ):
         mock_get_intent_model.return_value.invoke.return_value = MessageIntent(category="claim")
@@ -542,6 +561,40 @@ def test_delete_conversation_returns_500_on_unexpected_error(client: TestClient)
     assert response.status_code == 500
 
 
+def test_delete_conversation_cancels_any_pending_escalation(client: TestClient) -> None:
+    """A pending escalation for this thread (agent/escalations_db.py) would
+    otherwise be orphaned by the delete — still showing in the admin's
+    queue but pointing at checkpoint data that no longer exists. It should
+    be marked "cancelled" instead, not left dangling.
+    """
+    headers = _auth_header(user_id="user-1")
+    client.post("/chat", json={"claim": "claim one", "thread_id": _THREAD_ID}, headers=headers)
+
+    with patch("main.resolve_escalation") as mock_resolve:
+        response = client.delete(f"/conversations/{_THREAD_ID}", headers=headers)
+
+    assert response.status_code == 204
+    mock_resolve.assert_called_once_with(ANY, _THREAD_ID, "cancelled")
+
+
+def test_delete_conversation_succeeds_even_if_cancelling_escalation_fails(
+    client: TestClient,
+) -> None:
+    """The conversation delete itself is the real, must-succeed operation;
+    cancelling a pending escalation is secondary bookkeeping. A failure
+    there shouldn't turn an otherwise-successful delete into a 500 — same
+    fail-soft convention used throughout this codebase's secondary
+    bookkeeping (e.g. /chat's conversation-row and escalation-row writes).
+    """
+    headers = _auth_header(user_id="user-1")
+    client.post("/chat", json={"claim": "claim one", "thread_id": _THREAD_ID}, headers=headers)
+
+    with patch("main.resolve_escalation", side_effect=Exception("db hiccup")):
+        response = client.delete(f"/conversations/{_THREAD_ID}", headers=headers)
+
+    assert response.status_code == 204
+
+
 # --- retention purge on startup ---------------------------------------------------
 
 
@@ -572,6 +625,8 @@ def test_lifespan_purges_stale_conversations_and_their_checkpoints() -> None:
     ) as mock_build_pool, patch(
         "main.build_checkpointer", return_value=real_checkpointer
     ), patch("main.setup_users_table"), patch("main.setup_conversations_table"), patch(
+        "main.setup_escalations_table"
+    ), patch(
         "main.purge_stale_conversations",
         return_value=["stale-thread-1", "stale-thread-2"],
     ) as mock_purge, patch.object(
@@ -588,3 +643,271 @@ def test_lifespan_purges_stale_conversations_and_their_checkpoints() -> None:
         call("stale-thread-1"),
         call("stale-thread-2"),
     ]
+
+
+# --- /chat's pending-review guard -----------------------------------------------
+
+
+def test_chat_rejects_new_claim_on_thread_with_pending_review(client: TestClient) -> None:
+    """A thread with a still-pending escalation has a paused interrupt in
+    the graph (agent/orchestrator.py's human_review_node) — running a
+    fresh claim on it would silently abandon that pause rather than error
+    (confirmed empirically that a plain invoke on an interrupted thread
+    just starts a new turn instead of raising), which would later make the
+    admin's approve/reject on the orphaned escalation a silent no-op. This
+    is rejected up front instead.
+    """
+    with patch("main._get_thread_owner", return_value="user-1"), patch(
+        "main.get_pending_escalation", return_value={"status": "pending"}
+    ):
+        response = client.post(
+            "/chat",
+            json={"claim": "Another claim", "thread_id": _THREAD_ID},
+            headers=_auth_header(user_id="user-1"),
+        )
+    assert response.status_code == 409
+
+
+def test_chat_proceeds_normally_when_no_pending_review(client: TestClient) -> None:
+    with patch("main._get_thread_owner", return_value="user-1"), patch(
+        "main.get_pending_escalation", return_value=None
+    ):
+        response = client.post(
+            "/chat",
+            json={"claim": "Another claim", "thread_id": _THREAD_ID},
+            headers=_auth_header(user_id="user-1"),
+        )
+    assert response.status_code == 200
+
+
+def test_chat_skips_pending_review_check_for_a_brand_new_thread(client: TestClient) -> None:
+    """A brand-new thread (no thread_id sent at all) can't have a prior
+    escalation — the guard should be skipped entirely, not just pass
+    because get_pending_escalation happens to return None.
+    """
+    with patch("main.get_pending_escalation") as mock_get_pending:
+        response = client.post(
+            "/chat", json={"claim": "A brand new claim"}, headers=_auth_header(user_id="user-1")
+        )
+    assert response.status_code == 200
+    mock_get_pending.assert_not_called()
+
+
+# --- /admin/escalations --------------------------------------------------------
+
+_ADMIN_EMAIL = "admin@example.com"
+
+
+def test_get_escalations_rejects_non_admin_account(client: TestClient) -> None:
+    """A regular signed-in user — not just an anonymous request — must still
+    be rejected. Thread ownership isn't the gate here; require_admin is.
+    """
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL):
+        response = client.get(
+            "/admin/escalations", headers=_auth_header(email="regular@example.com")
+        )
+    assert response.status_code == 403
+
+
+def test_get_escalations_rejects_everyone_when_admin_email_unset(client: TestClient) -> None:
+    """Fails closed: an unset ADMIN_EMAIL means no account can reach this
+    endpoint, not that anyone can — see main.py's require_admin.
+    """
+    with patch("main.ADMIN_EMAIL", None):
+        response = client.get(
+            "/admin/escalations", headers=_auth_header(email=_ADMIN_EMAIL)
+        )
+    assert response.status_code == 403
+
+
+def test_get_escalations_returns_pending_list_for_admin(client: TestClient) -> None:
+    pending = [
+        {
+            "thread_id": "11111111-1111-1111-1111-111111111111",
+            "claim": "The sky is green.",
+            "verdict": "The evidence is unclear.",
+            "reason": "verdict_incomplete",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+    ]
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL), patch(
+        "main.list_pending_escalations", return_value=pending
+    ):
+        response = client.get(
+            "/admin/escalations", headers=_auth_header(email=_ADMIN_EMAIL)
+        )
+    assert response.status_code == 200
+    assert response.json() == pending
+
+
+def test_resolve_escalation_rejects_non_admin_account(client: TestClient) -> None:
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL):
+        response = client.post(
+            f"/admin/escalations/{_THREAD_ID}/resolve",
+            json={"decision": "approve"},
+            headers=_auth_header(email="regular@example.com"),
+        )
+    assert response.status_code == 403
+
+
+def test_resolve_escalation_rejects_invalid_uuid(client: TestClient) -> None:
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL):
+        response = client.post(
+            "/admin/escalations/not-a-uuid/resolve",
+            json={"decision": "approve"},
+            headers=_auth_header(email=_ADMIN_EMAIL),
+        )
+    assert response.status_code == 400
+
+
+def test_resolve_escalation_returns_404_when_nothing_pending(client: TestClient) -> None:
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL), patch(
+        "main.get_pending_escalation", return_value=None
+    ):
+        response = client.post(
+            f"/admin/escalations/{_THREAD_ID}/resolve",
+            json={"decision": "approve"},
+            headers=_auth_header(email=_ADMIN_EMAIL),
+        )
+    assert response.status_code == 404
+
+
+def test_resolve_escalation_resumes_graph_and_marks_resolved(client: TestClient) -> None:
+    escalation = {
+        "thread_id": _THREAD_ID,
+        "claim": "The sky is green.",
+        "verdict": "The evidence is unclear.",
+        "reason": "verdict_incomplete",
+        "status": "pending",
+    }
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL), patch(
+        "main.get_pending_escalation", return_value=escalation
+    ), patch("main.resume_review") as mock_resume, patch(
+        "main.resolve_escalation"
+    ) as mock_resolve:
+        response = client.post(
+            f"/admin/escalations/{_THREAD_ID}/resolve",
+            json={"decision": "approve"},
+            headers=_auth_header(email=_ADMIN_EMAIL),
+        )
+    assert response.status_code == 204
+    mock_resume.assert_called_once_with(ANY, _THREAD_ID, "approve")
+    mock_resolve.assert_called_once_with(ANY, _THREAD_ID, "approve")
+
+
+def test_resolve_escalation_succeeds_even_if_marking_resolved_fails(
+    client: TestClient,
+) -> None:
+    """resume_review() is the real side effect (it actually unblocks the
+    paused graph); resolve_escalation() is secondary bookkeeping. A failure
+    in the bookkeeping step, after the graph was already successfully
+    resumed, shouldn't turn into a 500 for the admin — same fail-soft
+    convention as /chat's conversation/escalation bookkeeping.
+    """
+    escalation = {
+        "thread_id": _THREAD_ID,
+        "claim": "The sky is green.",
+        "verdict": "The evidence is unclear.",
+        "reason": "verdict_incomplete",
+        "status": "pending",
+    }
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL), patch(
+        "main.get_pending_escalation", return_value=escalation
+    ), patch("main.resume_review") as mock_resume, patch(
+        "main.resolve_escalation", side_effect=Exception("db hiccup")
+    ):
+        response = client.post(
+            f"/admin/escalations/{_THREAD_ID}/resolve",
+            json={"decision": "approve"},
+            headers=_auth_header(email=_ADMIN_EMAIL),
+        )
+    assert response.status_code == 204
+    mock_resume.assert_called_once_with(ANY, _THREAD_ID, "approve")
+
+
+def test_resolve_escalation_rejects_invalid_decision_value(client: TestClient) -> None:
+    """decision is a Literal["approve", "reject"] on ResolveEscalationRequest
+    — anything else should fail Pydantic validation (422), not silently
+    fall through to resume_review with an unexpected value.
+    """
+    with patch("main.ADMIN_EMAIL", _ADMIN_EMAIL):
+        response = client.post(
+            f"/admin/escalations/{_THREAD_ID}/resolve",
+            json={"decision": "maybe"},
+            headers=_auth_header(email=_ADMIN_EMAIL),
+        )
+    assert response.status_code == 422
+
+
+# --- /chat's escalation bookkeeping ---------------------------------------------
+
+
+def test_chat_records_escalation_when_verdict_incomplete(client: TestClient) -> None:
+    """When a turn's verdict is judged incomplete (agent/verdict_completeness.py),
+    chat() should record it in the escalation review queue so the admin
+    account can see and resolve it later — see main.py's chat() handler and
+    agent/orchestrator.py's human_review_node.
+
+    Patches agent.orchestrator._check_and_store_verdict directly rather
+    than driving a real multi-step tool loop through the mocked model —
+    the fixture's default mock always returns a tool_call-free final
+    answer on the very first call regardless of tool_choice binding, so
+    there's no way to make it naturally call vector_lookup_tool first;
+    forcing the completeness result directly is the more precise, more
+    maintainable way to reach this branch.
+    """
+    with patch("agent.orchestrator._check_and_store_verdict", return_value=False), patch(
+        "main.create_escalation"
+    ) as mock_create_escalation:
+        response = client.post(
+            "/chat", json={"claim": "Is the sky green?"}, headers=_auth_header()
+        )
+    assert response.status_code == 200
+    thread_id = response.json()["thread_id"]
+
+    mock_create_escalation.assert_called_once()
+    args, kwargs = mock_create_escalation.call_args
+    assert args[1] == thread_id
+    assert kwargs["claim"] == "Is the sky green?"
+    assert kwargs["verdict"] == "Final answer."
+    assert kwargs["reason"] == "verdict_incomplete"
+
+
+def test_chat_does_not_record_escalation_when_verdict_complete(client: TestClient) -> None:
+    with patch("agent.orchestrator._check_and_store_verdict", return_value=True), patch(
+        "main.create_escalation"
+    ) as mock_create_escalation:
+        response = client.post(
+            "/chat", json={"claim": "Is the sky green?"}, headers=_auth_header()
+        )
+    assert response.status_code == 200
+    mock_create_escalation.assert_not_called()
+
+
+def test_chat_never_stores_raw_pii_in_an_escalation_row(client: TestClient) -> None:
+    """Regression test, same shape as test_graph.py's
+    test_run_claim_never_checkpoints_raw_pii and
+    test_run_claim_returns_the_scrubbed_claim_not_the_raw_input — the
+    escalations table (agent/escalations_db.py) is a newer, separate place
+    PII could in principle leak into if it ever read from raw request text
+    instead of the already-scrubbed claim, the same class of bug as the
+    earlier conversation-title leak. It doesn't (create_escalation() is
+    called with result["pending_review"]["claim"], which is read from
+    state["messages"] after scrub_pii() already ran in graph.run_claim()),
+    but that's worth proving with a real assertion, not just reasoning
+    about the code.
+    """
+    with patch("agent.orchestrator._check_and_store_verdict", return_value=False), patch(
+        "main.create_escalation"
+    ) as mock_create_escalation:
+        response = client.post(
+            "/chat",
+            json={"claim": "Email me at jane@example.com about this claim."},
+            headers=_auth_header(),
+        )
+    assert response.status_code == 200
+
+    mock_create_escalation.assert_called_once()
+    _, kwargs = mock_create_escalation.call_args
+    assert "jane@example.com" not in kwargs["claim"]
+    assert "[REDACTED_EMAIL]" in kwargs["claim"]

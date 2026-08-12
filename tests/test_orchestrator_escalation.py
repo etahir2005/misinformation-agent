@@ -64,9 +64,10 @@ def test_route_after_orchestrator_ends_when_verdict_is_complete_unset() -> None:
     assert route_after_orchestrator(state) == END
 
 
+@patch("agent.orchestrator._store_verdict_if_new")
 @patch("agent.orchestrator.interrupt")
 def test_human_review_node_calls_interrupt_with_claim_and_verdict(
-    mock_interrupt: MagicMock,
+    mock_interrupt: MagicMock, mock_store: MagicMock
 ) -> None:
     mock_interrupt.return_value = None
     state = {
@@ -85,6 +86,53 @@ def test_human_review_node_calls_interrupt_with_claim_and_verdict(
     assert payload["reason"] == "verdict_incomplete"
     assert payload["claim"] == "Is the sky green?"
     assert payload["verdict"] == "The evidence is unclear."
+    mock_store.assert_not_called()
+
+
+@patch("agent.orchestrator._store_verdict_if_new")
+@patch("agent.orchestrator.interrupt")
+def test_human_review_node_stores_verdict_when_admin_approves(
+    mock_interrupt: MagicMock, mock_store: MagicMock
+) -> None:
+    """A resume value of "approve" (Command(resume="approve") on the real
+    graph) should cache the verdict — this is the whole point of the
+    admin's approval, see human_review_node's docstring on what the
+    review is actually gating (the shared cache, not the answer already
+    shown to the asker).
+    """
+    mock_interrupt.return_value = "approve"
+    state = {
+        "messages": [
+            HumanMessage(content="Is the sky green?"),
+            AIMessage(content="The evidence is unclear."),
+        ],
+        "verdict_is_complete": False,
+    }
+
+    result = human_review_node(state)
+
+    assert result == {}
+    mock_store.assert_called_once()
+
+
+@patch("agent.orchestrator._store_verdict_if_new")
+@patch("agent.orchestrator.interrupt")
+def test_human_review_node_does_not_store_verdict_when_admin_rejects(
+    mock_interrupt: MagicMock, mock_store: MagicMock
+) -> None:
+    mock_interrupt.return_value = "reject"
+    state = {
+        "messages": [
+            HumanMessage(content="Is the sky green?"),
+            AIMessage(content="The evidence is unclear."),
+        ],
+        "verdict_is_complete": False,
+    }
+
+    result = human_review_node(state)
+
+    assert result == {}
+    mock_store.assert_not_called()
 
 
 class _MinimalState(TypedDict):

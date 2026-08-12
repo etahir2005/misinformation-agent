@@ -3,6 +3,7 @@
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -15,7 +16,7 @@ from agent.auth import (
     verify_password,
 )
 from agent.checkpointer import build_checkpointer, build_connection_pool
-from agent.config import CONVERSATION_RETENTION_DAYS
+from agent.config import ADMIN_EMAIL, CONVERSATION_RETENTION_DAYS
 from agent.conversations_db import (
     create_conversation,
     delete_conversation,
@@ -25,13 +26,20 @@ from agent.conversations_db import (
     setup_conversations_table,
     touch_conversation,
 )
+from agent.escalations_db import (
+    create_escalation,
+    get_pending_escalation,
+    list_pending_escalations,
+    resolve_escalation,
+    setup_escalations_table,
+)
 from agent.users_db import (
     EmailAlreadyRegisteredError,
     create_user,
     get_user_by_email,
     setup_users_table,
 )
-from graph import build_graph, run_claim
+from graph import build_graph, resume_review, run_claim
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +117,24 @@ def get_current_user(
     return {"id": payload["sub"], "email": payload["email"]}
 
 
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """Extra gate on top of get_current_user for the admin-only escalation endpoints.
+
+    Compares the authenticated user's email against ADMIN_EMAIL — the only
+    distinction between a regular account and the reviewer account in this
+    project (see agent/config.py's ADMIN_EMAIL for why this is a config
+    value rather than a database role column). Fails closed: an unset
+    ADMIN_EMAIL means no account at all — not even a real signed-in one —
+    can reach an admin endpoint, rather than accidentally granting access
+    to everyone.
+    """
+    if not ADMIN_EMAIL or current_user["email"] != ADMIN_EMAIL:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required."
+        )
+    return current_user
+
+
 def _get_thread_owner(graph, thread_id: str) -> str | None:
     """Look up which user_id owns an existing thread, or None if unknown.
 
@@ -142,6 +168,7 @@ async def lifespan(app: FastAPI):
         app.state.pool = pool
         setup_users_table(pool)
         setup_conversations_table(pool)
+        setup_escalations_table(pool)
         checkpointer = build_checkpointer(pool)
         app.state.graph = build_graph(checkpointer)
 
@@ -194,6 +221,18 @@ class ChatResponse(BaseModel):
     answer: str
     thread_id: str
     recursion_limit_hit: bool
+
+
+class EscalationSummary(BaseModel):
+    thread_id: str
+    claim: str
+    verdict: str
+    reason: str
+    created_at: str
+
+
+class ResolveEscalationRequest(BaseModel):
+    decision: Literal["approve", "reject"]
 
 
 class ConversationSummary(BaseModel):
@@ -309,6 +348,26 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
         thread_id = str(uuid.uuid4())
         is_new_thread = True
 
+    # A thread with a still-pending human review has a paused interrupt
+    # sitting in the graph (see agent/orchestrator.py's human_review_node).
+    # Running a fresh claim on it would silently abandon that pause rather
+    # than error — confirmed empirically that a plain (non-Command) invoke
+    # on an interrupted thread just starts a new turn, orphaning the old
+    # interrupt instead of raising. If that happened, the admin's later
+    # approve/reject on the orphaned escalation would become a silent
+    # no-op (resuming a thread that's already moved past that point) —
+    # so this is rejected up front instead, with a clear error, rather
+    # than left to fail invisibly later. Skipped for a brand-new thread,
+    # which can't have a prior escalation by definition.
+    if not is_new_thread and get_pending_escalation(app.state.pool, thread_id) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This conversation has a claim awaiting human review — please "
+                "wait for it to be resolved before sending another message."
+            ),
+        )
+
     try:
         result = run_claim(app.state.graph, request.claim, thread_id, user_id=current_user["id"])
     except Exception:
@@ -346,6 +405,25 @@ def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)) -
             touch_conversation(app.state.pool, thread_id)
     except Exception:
         logger.exception("Failed to record conversation %s in the sidebar list.", thread_id)
+
+    # This turn's verdict was judged incomplete and the graph paused at
+    # human_review_node (see agent/orchestrator.py) — record it in the
+    # review queue so the admin account can see and resolve it. Same
+    # fail-soft convention as the sidebar bookkeeping above: the answer is
+    # already safely checkpointed and was already returned to this asker,
+    # so a failure here shouldn't turn into a 500 for a claim that was
+    # actually processed successfully.
+    if result["pending_review"] is not None:
+        try:
+            create_escalation(
+                app.state.pool,
+                thread_id,
+                claim=result["pending_review"]["claim"],
+                verdict=result["pending_review"]["verdict"],
+                reason=result["pending_review"]["reason"],
+            )
+        except Exception:
+            logger.exception("Failed to record escalation for thread %s.", thread_id)
 
     messages = result["messages"]
     answer = _extract_text(messages[-1].content) if messages else ""
@@ -421,3 +499,82 @@ def delete_conversation_endpoint(
         raise HTTPException(
             status_code=500, detail="Something went wrong deleting this conversation."
         )
+
+    # A pending escalation for this thread (agent/escalations_db.py) would
+    # otherwise be orphaned by the delete above — it'd keep showing in the
+    # admin's review queue, but resolving it would try to resume a thread
+    # whose checkpoint data no longer exists. Confirmed empirically that
+    # this doesn't raise cleanly: LangGraph treats a resume against a
+    # missing checkpoint as a fresh run with no real input, which would
+    # likely fail deep inside the orchestrator's own nodes rather than
+    # erroring clearly at the resume call itself — main.py's resolve
+    # endpoint would surface that as an opaque 500 with no indication the
+    # real cause is "this conversation was deleted." "cancelled" (not
+    # "approved"/"rejected" — neither actually happened) removes it from
+    # the pending queue up front instead. Fail-soft, same convention as
+    # the rest of this codebase's secondary bookkeeping: the conversation
+    # itself was already successfully deleted by this point, so a failure
+    # here shouldn't turn into a 500 for a delete that actually succeeded.
+    try:
+        resolve_escalation(app.state.pool, thread_id, "cancelled")
+    except Exception:
+        logger.exception("Failed to cancel escalation for deleted thread %s.", thread_id)
+
+
+@app.get("/admin/escalations", response_model=list[EscalationSummary])
+def get_escalations(admin: dict = Depends(require_admin)) -> list[EscalationSummary]:
+    """List every still-pending human-review escalation, oldest first. Admin-only."""
+    rows = list_pending_escalations(app.state.pool)
+    return [EscalationSummary(**row) for row in rows]
+
+
+@app.post("/admin/escalations/{thread_id}/resolve", status_code=status.HTTP_204_NO_CONTENT)
+def resolve_escalation_endpoint(
+    thread_id: str, request: ResolveEscalationRequest, admin: dict = Depends(require_admin)
+) -> None:
+    """Resume a paused thread with the admin's approve/reject decision. Admin-only.
+
+    "approve" resumes the graph so human_review_node writes the verdict
+    into the shared semantic cache; "reject" resumes it without caching —
+    either way, the original asker already has their answer (it was
+    returned before the pause happened), so this only affects future
+    reuse. Deliberately not thread-ownership-checked like the /conversations
+    endpoints — an admin resolving a review queue is, by design, acting on
+    someone else's thread; require_admin is the access control here, not
+    _get_thread_owner.
+
+    resume_review() (the real side effect — it actually unblocks the paused
+    graph and, on approve, writes to the cache) runs first and is allowed
+    to fail the request with a 500; marking the escalations row resolved
+    runs second and is deliberately fail-soft, same convention as /chat's
+    conversation-row and escalation-row bookkeeping above. By the time
+    resolve_escalation() runs, the graph has already been successfully
+    resumed — turning a bookkeeping hiccup into a 500 here would make the
+    admin think nothing happened and retry. Confirmed empirically (not
+    assumed) that this retry case is safe: Command(resume=...) against a
+    thread with no pending interrupt is a no-op — LangGraph returns the
+    existing terminal state without re-running any node logic, so a second
+    resume can't double-write to the cache or raise.
+    """
+    if not _is_valid_uuid(thread_id):
+        raise HTTPException(status_code=400, detail="thread_id must be a valid UUID.")
+
+    escalation = get_pending_escalation(app.state.pool, thread_id)
+    if escalation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No pending escalation for this thread.",
+        )
+
+    try:
+        resume_review(app.state.graph, thread_id, request.decision)
+    except Exception:
+        logger.exception("Failed to resume thread %s after admin decision.", thread_id)
+        raise HTTPException(
+            status_code=500, detail="Something went wrong resolving this escalation."
+        )
+
+    try:
+        resolve_escalation(app.state.pool, thread_id, request.decision)
+    except Exception:
+        logger.exception("Failed to mark escalation resolved for thread %s.", thread_id)

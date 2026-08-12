@@ -17,6 +17,7 @@ from agent.orchestrator_responses import (
     _build_cache_hit_response,
     _check_and_store_verdict,
     _gather_sources_for_scoring,
+    _store_verdict_if_new,
 )
 from agent.orchestrator_routing import (
     _SUMMARY_MESSAGE_ID,
@@ -243,34 +244,44 @@ def human_review_node(state: OrchestratorState) -> dict:
 
     Only reached via route_after_orchestrator when verdict_is_complete is
     False. interrupt() pauses execution here and surfaces the payload below
-    to whatever's driving the graph — nothing consumes it yet. Phase 4
-    (Slack escalation tool) and Phase 5 (Streamlit approval UI) are what
-    will actually notify a human and let them respond with
-    Command(resume=...); this node only proves the pause/resume mechanics
-    work, it doesn't yet decide what a human's response should change.
+    to whatever's driving the graph — main.py's admin-only escalation
+    endpoints (see agent/escalations_db.py) are what actually notify a
+    reviewer and let them respond via graph.py's resume_review(), which
+    resumes with Command(resume="approve"/"reject").
 
-    IMPORTANT for whoever builds Phase 4's Slack notification: LangGraph
-    re-executes a node's logic from the top on every resume, not just the
-    interrupt() call itself. A one-time side effect like sending a Slack
-    message placed *before* this interrupt() call would fire again on
-    every resume unless it's made idempotent or split into its own node
-    that runs once, ahead of this one. Do not add the Slack call directly
-    into this node as currently written.
+    The answer itself was already shown to the original asker before this
+    node ever ran (call_model already added it to state["messages"], which
+    is checkpointed before this node executes) — this pause is not about
+    withholding the answer. It's about whether a shaky verdict should be
+    trusted enough to write into the *shared* semantic cache
+    (vector_lookup_tool), where it would get reused for every future
+    semantically-similar claim, not just this one asker's turn. "approve"
+    caches it anyway; "reject" (or anything else) leaves it uncached, same
+    as before this node existed.
 
-    The resume value's shape isn't finalized — Phase 5 decides what a human
-    actually submits. Resuming with any value (or none) simply lets the
-    graph finish with the existing answer for now; nothing reads the
-    resume value yet.
+    IMPORTANT: LangGraph re-executes a node's logic from the top on every
+    resume, not just the interrupt() call itself. That's harmless here —
+    re-reading latest_human_message/final_answer from state is a pure,
+    side-effect-free read, and interrupt() itself only returns a value
+    (rather than pausing again) on the resumed pass, so _store_verdict_if_new
+    below only ever runs once per resume, not once per re-execution. This
+    would NOT be true for a one-time side effect like a Slack notification
+    placed before the interrupt() call — that's why Phase 4's Slack tool
+    must live in its own node that runs once, ahead of this one, not inside
+    this node's body.
     """
     latest_human_message = _current_turn_messages(state)[0]
     final_answer = state["messages"][-1]
-    interrupt(
+    decision = interrupt(
         {
             "reason": "verdict_incomplete",
             "claim": latest_human_message.content,
             "verdict": final_answer.content,
         }
     )
+    if decision == "approve":
+        turn_state = {"messages": _current_turn_messages(state)}
+        _store_verdict_if_new(turn_state)
     return {}
 
 

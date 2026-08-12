@@ -5,9 +5,10 @@ from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from agent.guardrail import MessageIntent
-from graph import build_graph, run_claim
+from graph import build_graph, resume_review, run_claim
 
 
 @patch("agent.guardrail._get_intent_model")
@@ -104,3 +105,21 @@ def test_run_claim_handles_recursion_limit_gracefully(mock_build_orchestrator: M
 
     assert result["recursion_limit_hit"] is True
     assert result["messages"][-1].content == "partial progress"
+
+
+def test_resume_review_invokes_with_command_resume_scoped_to_thread() -> None:
+    """resume_review() should hand LangGraph's own Command(resume=...)
+    wrapper to graph.invoke(), scoped to the given thread_id via
+    config["configurable"] — this is the actual mechanism that unblocks a
+    thread paused at human_review_node (agent/orchestrator.py).
+    """
+    mock_graph = MagicMock()
+
+    resume_review(mock_graph, "some-thread-id", "approve")
+
+    mock_graph.invoke.assert_called_once()
+    args, kwargs = mock_graph.invoke.call_args
+    resume_command = args[0]
+    assert isinstance(resume_command, Command)
+    assert resume_command.resume == "approve"
+    assert kwargs["config"]["configurable"]["thread_id"] == "some-thread-id"

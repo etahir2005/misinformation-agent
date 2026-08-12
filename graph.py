@@ -11,6 +11,7 @@ import logging
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from agent.orchestrator import build_orchestrator, scrub_pii
 from agent.tracing import get_langfuse_handler
@@ -101,3 +102,23 @@ def run_claim(graph, claim: str, thread_id: str, user_id: str | None = None) -> 
             "pending_review": None,
             "claim": claim,
         }
+
+
+def resume_review(graph, thread_id: str, decision: str) -> None:
+    """Resume a thread paused at human_review_node with an admin's decision.
+
+    decision is "approve" or "reject" (see main.py's ResolveEscalationRequest
+    and agent/orchestrator.py's human_review_node) — passed straight through
+    as the interrupt()'s resume value. No return value: the original asker
+    already has their answer (it was shown before the pause ever happened,
+    see human_review_node's docstring), so resuming here only affects
+    whether the verdict gets written into the shared semantic cache. Callers
+    don't need anything back beyond confirmation that the resume itself
+    didn't raise.
+
+    No PII-scrub or recursion-limit handling needed here unlike run_claim()
+    — this doesn't process new user input, it only unblocks a node that's
+    already paused mid-graph, so neither concern applies.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    graph.invoke(Command(resume=decision), config=config)

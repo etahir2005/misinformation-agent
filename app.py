@@ -17,6 +17,14 @@ load_dotenv()
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 REQUEST_TIMEOUT_SECONDS = 120
 
+# Mirrors main.py's ADMIN_EMAIL (agent/config.py) — compared against the
+# signed-in user's own email (set on login/signup below) to decide whether
+# to show the Pending Reviews section at all. This is purely a UI-level
+# convenience: the real access control is main.py's require_admin, which
+# checks the same value server-side on every /admin/* call regardless of
+# what this UI shows or hides.
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+
 st.set_page_config(
     page_title="Misinformation Agent",
     page_icon="🔎",
@@ -244,9 +252,45 @@ def _delete_conversation(thread_id: str) -> bool:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
+        _apply_refreshed_token(response)
         return True
     except requests.exceptions.RequestException:
         st.error("Couldn't delete that conversation — is the API running?")
+        return False
+
+
+def _fetch_pending_escalations() -> list[dict]:
+    """Fetch the admin-only review queue. Fails soft, same convention as
+    _fetch_conversations — an unreachable backend or a non-admin account
+    (403) just means an empty list for this render, not a crash.
+    """
+    try:
+        response = requests.get(
+            f"{API_URL}/admin/escalations",
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        _apply_refreshed_token(response)
+        return response.json()
+    except requests.exceptions.RequestException:
+        return []
+
+
+def _resolve_escalation(thread_id: str, decision: str) -> bool:
+    """Submit an approve/reject decision for a pending escalation. Returns True on success."""
+    try:
+        response = requests.post(
+            f"{API_URL}/admin/escalations/{thread_id}/resolve",
+            json={"decision": decision},
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        _apply_refreshed_token(response)
+        return True
+    except requests.exceptions.RequestException:
+        st.error("Couldn't resolve that escalation — is the API running?")
         return False
 
 
@@ -272,6 +316,11 @@ if st.session_state.access_token is None:
                     # bubbles.
                     st.session_state.thread_id = str(uuid.uuid4())
                     st.session_state.messages = []
+                    # Only used to decide whether to show the Pending
+                    # Reviews section — see ADMIN_EMAIL above. Not a
+                    # security boundary on its own; main.py's require_admin
+                    # re-checks this server-side on every /admin/* call.
+                    st.session_state.user_email = email
                     st.rerun()
 
     with signup_tab:
@@ -286,6 +335,7 @@ if st.session_state.access_token is None:
                     st.session_state.access_token = token
                     st.session_state.thread_id = str(uuid.uuid4())
                     st.session_state.messages = []
+                    st.session_state.user_email = email
                     st.rerun()
 
     st.stop()
@@ -360,7 +410,35 @@ with st.sidebar:
         st.session_state.access_token = None
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
+        st.session_state.user_email = None
         st.rerun()
+
+    if ADMIN_EMAIL and st.session_state.get("user_email") == ADMIN_EMAIL:
+        st.divider()
+        pending = _fetch_pending_escalations()
+        st.markdown(f"### 🛡️ Pending Reviews ({len(pending)})")
+        for item in pending:
+            preview = item["claim"][:60] + ("…" if len(item["claim"]) > 60 else "")
+            with st.expander(preview):
+                st.markdown(f"**Verdict:** {item['verdict']}")
+                st.markdown(f"**Flagged because:** {item['reason']}")
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    if st.button(
+                        "✅ Approve",
+                        key=f"approve_{item['thread_id']}",
+                        use_container_width=True,
+                    ):
+                        if _resolve_escalation(item["thread_id"], "approve"):
+                            st.rerun()
+                with reject_col:
+                    if st.button(
+                        "❌ Reject",
+                        key=f"reject_{item['thread_id']}",
+                        use_container_width=True,
+                    ):
+                        if _resolve_escalation(item["thread_id"], "reject"):
+                            st.rerun()
 
     with st.expander("How this works"):
         st.markdown(
@@ -435,8 +513,18 @@ if claim:
                 if response.status_code in (401, 403):
                     st.session_state.access_token = None
                     st.rerun()
-                answer = "The request failed — please try again."
-                banner = ("error", "⛔ Request failed")
+                if response.status_code == 409:
+                    # A claim rejected because this thread has a review
+                    # still pending (main.py's /chat) — the backend's own
+                    # detail message explains this clearly; a generic
+                    # "please try again" would be actively misleading here,
+                    # since retrying the same message won't help until the
+                    # pending review is resolved.
+                    answer = response.json().get("detail", "This conversation is on hold.")
+                    banner = ("partial", "⏸️ Awaiting review")
+                else:
+                    answer = "The request failed — please try again."
+                    banner = ("error", "⛔ Request failed")
             except requests.exceptions.RequestException as exc:
                 answer = f"Something went wrong: {exc}"
                 banner = ("error", "⛔ Request failed")
