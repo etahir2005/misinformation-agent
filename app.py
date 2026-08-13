@@ -651,12 +651,24 @@ if claim:
         # network call itself.
         _result: dict = {}
 
+        # Snapshot into plain locals on the main thread before the worker
+        # starts — st.session_state is only resolvable on the thread that
+        # holds Streamlit's ScriptRunContext (the main script thread). A
+        # plain threading.Thread never gets one, so reading
+        # st.session_state.thread_id/access_token from inside _run_request
+        # itself raises "st.session_state has no attribute ..." on every
+        # call, not just intermittently — it just happened to first surface
+        # here. The thread closure below must only ever touch these locals,
+        # never st.session_state directly.
+        _thread_id = st.session_state.thread_id
+        _access_token = st.session_state.access_token
+
         def _run_request() -> None:
             try:
                 _result["response"] = requests.post(
                     f"{API_URL}/chat",
-                    json={"claim": claim, "thread_id": st.session_state.thread_id},
-                    headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+                    json={"claim": claim, "thread_id": _thread_id},
+                    headers={"Authorization": f"Bearer {_access_token}"},
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
